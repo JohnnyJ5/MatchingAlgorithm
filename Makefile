@@ -80,6 +80,8 @@ docker-build:
 	docker build -t $(DOCKER_IMAGE) .
 
 docker-start: docker-build
+	-docker stop $(DOCKER_NAME) 2>/dev/null
+	-docker rm   $(DOCKER_NAME) 2>/dev/null
 	docker run -d --name $(DOCKER_NAME) -p 9090:9090 $(DOCKER_IMAGE)
 	@echo "Server running at http://localhost:9090"
 
