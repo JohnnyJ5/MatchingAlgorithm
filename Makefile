@@ -13,7 +13,11 @@ ALGO_SRCS := src/gale_shapley.cpp \
 ALGO_OBJS := $(patsubst src/%.cpp, $(BUILD)/%.o, $(ALGO_SRCS))
 
 # ── Top-level targets ─────────────────────────────────────────────────────────
-.PHONY: all tests run_tests run run_server clean
+DOCKER_IMAGE := matching-algorithm
+DOCKER_NAME  := matching-algorithm
+
+.PHONY: all tests run_tests run run_server clean \
+        docker-build docker-start docker-stop
 
 all: $(BUILD)/main tests $(BUILD)/server
 
@@ -70,3 +74,20 @@ $(BUILD):
 
 clean:
 	rm -rf $(BUILD)
+
+# ── Docker ────────────────────────────────────────────────────────────────────
+docker-build:
+	docker build -t $(DOCKER_IMAGE) .
+
+docker-start:
+	@if docker ps -aq -f name=^$(DOCKER_NAME)$$ | grep -q .; then \
+	    docker stop $(DOCKER_NAME); \
+	    docker start $(DOCKER_NAME); \
+	else \
+	    $(MAKE) docker-build; \
+	    docker run -d --name $(DOCKER_NAME) -p 9090:9090 $(DOCKER_IMAGE); \
+	fi
+	@echo "Server running at http://localhost:9090"
+
+docker-stop:
+	docker stop $(DOCKER_NAME)
