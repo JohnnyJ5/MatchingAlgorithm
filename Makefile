@@ -79,12 +79,15 @@ clean:
 docker-build:
 	docker build -t $(DOCKER_IMAGE) .
 
-docker-start: docker-build
-	-docker stop $(DOCKER_NAME) 2>/dev/null
-	-docker rm   $(DOCKER_NAME) 2>/dev/null
-	docker run -d --name $(DOCKER_NAME) -p 9090:9090 $(DOCKER_IMAGE)
+docker-start:
+	@if docker ps -aq -f name=^$(DOCKER_NAME)$$ | grep -q .; then \
+	    docker stop $(DOCKER_NAME); \
+	    docker start $(DOCKER_NAME); \
+	else \
+	    $(MAKE) docker-build; \
+	    docker run -d --name $(DOCKER_NAME) -p 9090:9090 $(DOCKER_IMAGE); \
+	fi
 	@echo "Server running at http://localhost:9090"
 
 docker-stop:
 	docker stop $(DOCKER_NAME)
-	docker rm   $(DOCKER_NAME)
