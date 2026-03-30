@@ -8,6 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         make \
         cmake \
         libasio-dev \
+        libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -24,6 +25,7 @@ FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libstdc++6 \
+        libpq5 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
