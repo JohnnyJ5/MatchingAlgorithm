@@ -51,9 +51,13 @@
 #include "../src/hungarian.h"
 #include "../src/blossom.h"
 
+#include <libpq-fe.h>
+
 #include <algorithm>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <mutex>
 #include <numeric>
 #include <sstream>
 #include <string>
@@ -141,6 +145,13 @@ static std::vector<std::vector<int>> buildWomenPrefs()
                   [&](int a, int b){ return COMPAT[a][w] > COMPAT[b][w]; });
     }
     return prefs;
+}
+
+// Returns the value of an environment variable, or a default if not set.
+static std::string getenv_or(const char* name, const char* fallback)
+{
+    const char* v = std::getenv(name);
+    return v ? v : fallback;
 }
 
 // Read a file from disk into a string (used to serve static HTML/CSS/JS).
@@ -237,6 +248,25 @@ static crow::json::wvalue runBlossom()
 
 int main()
 {
+    // ── PostgreSQL connection ────────────────────────────────────────────────
+    std::string connStr =
+        "host="     + getenv_or("DB_HOST",     "db")   +
+        " port="    + getenv_or("DB_PORT",     "5432") +
+        " dbname="  + getenv_or("DB_NAME",     "")     +
+        " user="    + getenv_or("DB_USER",     "")     +
+        " password="+ getenv_or("DB_PASSWORD", "");
+
+    PGconn* db = PQconnectdb(connStr.c_str());
+    if (PQstatus(db) != CONNECTION_OK) {
+        std::cerr << "DB connect failed: " << PQerrorMessage(db) << "\n";
+        PQfinish(db);
+        return 1;
+    }
+    std::cout << "Connected to PostgreSQL\n";
+
+    // Serialises all DB access — libpq connections are not thread-safe.
+    std::mutex db_mutex;
+
     crow::SimpleApp app;
 
     // ── Serve static UI ──────────────────────────────────────────────────────
@@ -278,88 +308,339 @@ int main()
     // ── User Management ───────────────────────────────────────────────────────
 
     // POST /api/users/register
-    // Body: { "name": string, "gender": "male"|"female", "email": string, "password": string }
-    // Creates a new participant account.  Hashes the password before storage.
-    // Returns: { "id": int, "name": string, "token": string }
+    // Body: { "alias", "real_name", "email", "password", "gender", "age", ["bio"], ["interests"] }
+    // Hashes the password via pgcrypto's crypt()/gen_salt('bf') in SQL.
+    // Returns: { "id": int, "alias": string }
     CROW_ROUTE(app, "/api/users/register").methods(crow::HTTPMethod::POST)(
-    [](const crow::request& req){
-        // TODO: parse req.body as JSON
-        // TODO: validate required fields (name, gender, email, password)
-        // TODO: check that email is not already registered
-        // TODO: hash password with bcrypt/argon2 before storing
-        // TODO: insert into users DB table; return generated user ID + JWT token
-        crow::json::wvalue res;
-        res["message"] = "register endpoint — not yet wired to a database";
-        res["status"]  = "stub";
-        return crow::response(501, res);
+    [&db, &db_mutex](const crow::request& req){
+        auto body = crow::json::load(req.body);
+        if (!body)
+            return crow::response(400, "{\"error\":\"invalid JSON\"}");
+
+        // Validate required fields
+        for (const char* f : {"alias","real_name","email","password","gender","age"}) {
+            if (!body.has(f)) {
+                crow::json::wvalue e; e["error"] = std::string("missing field: ") + f;
+                return crow::response(400, e);
+            }
+        }
+
+        std::string alias     = body["alias"].s();
+        std::string real_name = body["real_name"].s();
+        std::string email     = body["email"].s();
+        std::string password  = body["password"].s();
+        std::string gender    = body["gender"].s();
+        std::string age_str   = std::to_string(body["age"].i());
+        std::string bio       = body.has("bio") ? std::string(body["bio"].s()) : "";
+
+        if (gender != "male" && gender != "female") {
+            crow::json::wvalue e; e["error"] = "gender must be 'male' or 'female'";
+            return crow::response(400, e);
+        }
+
+        int age_val = static_cast<int>(body["age"].i());
+        if (age_val < 18 || age_val > 120) {
+            crow::json::wvalue e; e["error"] = "age must be between 18 and 120";
+            return crow::response(400, e);
+        }
+
+        // Build interests as a PostgreSQL array literal e.g. "{hiking,jazz}"
+        std::string interests_arr = "{}";
+        if (body.has("interests") && body["interests"].t() == crow::json::type::List) {
+            interests_arr = "{";
+            bool first = true;
+            for (const auto& item : body["interests"]) {
+                if (!first) interests_arr += ",";
+                interests_arr += "\"" + std::string(item.s()) + "\"";
+                first = false;
+            }
+            interests_arr += "}";
+        }
+
+        const char* params[] = {
+            alias.c_str(), real_name.c_str(), email.c_str(), password.c_str(),
+            gender.c_str(), age_str.c_str(), bio.c_str(), interests_arr.c_str()
+        };
+
+        std::lock_guard<std::mutex> lock(db_mutex);
+        PGresult* pgres = PQexecParams(db,
+            "INSERT INTO users (alias, real_name, email, password_hash, gender, age, bio, interests) "
+            "VALUES ($1, $2, $3, crypt($4, gen_salt('bf')), $5::gender_type, $6::smallint, "
+            "NULLIF($7,''), $8::text[]) "
+            "RETURNING id, alias",
+            8, nullptr, params, nullptr, nullptr, 0);
+
+        if (PQresultStatus(pgres) != PGRES_TUPLES_OK) {
+            std::string sqlstate = PQresultErrorField(pgres, PG_DIAG_SQLSTATE);
+            PQclear(pgres);
+            if (sqlstate == "23505") {
+                crow::json::wvalue e; e["error"] = "email already registered";
+                return crow::response(409, e);
+            }
+            crow::json::wvalue e; e["error"] = "registration failed";
+            return crow::response(500, e);
+        }
+
+        crow::json::wvalue out;
+        out["id"]    = std::stoll(PQgetvalue(pgres, 0, 0));
+        out["alias"] = std::string(PQgetvalue(pgres, 0, 1));
+        PQclear(pgres);
+        return crow::response(201, out);
     });
 
     // POST /api/users/login
     // Body: { "email": string, "password": string }
-    // Validates credentials and issues a signed JWT session token.
-    // Returns: { "token": string, "userId": int, "name": string }
+    // Verifies credentials via pgcrypto's crypt() comparison.
+    // Returns: { "userId": int, "alias": string, "role": string }
     CROW_ROUTE(app, "/api/users/login").methods(crow::HTTPMethod::POST)(
-    [](const crow::request& req){
-        // TODO: parse body; look up user by email
-        // TODO: verify password hash
-        // TODO: sign and return a JWT (or session cookie) with userId + expiry
-        crow::json::wvalue res;
-        res["message"] = "login endpoint — not yet wired to a database";
-        res["status"]  = "stub";
-        return crow::response(501, res);
+    [&db, &db_mutex](const crow::request& req){
+        auto body = crow::json::load(req.body);
+        if (!body)
+            return crow::response(400, "{\"error\":\"invalid JSON\"}");
+
+        if (!body.has("email") || !body.has("password")) {
+            crow::json::wvalue e; e["error"] = "email and password required";
+            return crow::response(400, e);
+        }
+
+        std::string email    = body["email"].s();
+        std::string password = body["password"].s();
+
+        const char* params[] = { email.c_str(), password.c_str() };
+
+        std::lock_guard<std::mutex> lock(db_mutex);
+        PGresult* pgres = PQexecParams(db,
+            "SELECT id, alias, role FROM users "
+            "WHERE email = $1 "
+            "  AND password_hash = crypt($2, password_hash) "
+            "  AND deleted_at IS NULL",
+            2, nullptr, params, nullptr, nullptr, 0);
+
+        if (PQresultStatus(pgres) != PGRES_TUPLES_OK || PQntuples(pgres) == 0) {
+            PQclear(pgres);
+            crow::json::wvalue e; e["error"] = "invalid email or password";
+            return crow::response(401, e);
+        }
+
+        crow::json::wvalue out;
+        out["userId"] = std::stoll(PQgetvalue(pgres, 0, 0));
+        out["alias"]  = std::string(PQgetvalue(pgres, 0, 1));
+        out["role"]   = std::string(PQgetvalue(pgres, 0, 2));
+        PQclear(pgres);
+        return crow::response(200, out);
     });
 
     // GET /api/users
-    // Admin-only.  Returns a paginated list of all participants.
+    // Returns a paginated list of active participants (no PII).
     // Query params: ?page=1&limit=20&gender=male|female
-    CROW_ROUTE(app, "/api/users")([](){
-        // TODO: verify admin role from JWT
-        // TODO: query DB with pagination and optional gender filter
-        // TODO: return array of { id, name, gender, registeredAt, hasCompletedQuestionnaire }
-        crow::json::wvalue res;
-        res["message"] = "user list endpoint — not yet wired to a database";
-        res["users"]   = crow::json::wvalue::list{};
-        return crow::response(200, res);
+    // TODO: gate behind admin JWT for production
+    CROW_ROUTE(app, "/api/users").methods(crow::HTTPMethod::GET)(
+    [&db, &db_mutex](const crow::request& req){
+        int page  = 1, limit = 20;
+        if (req.url_params.get("page"))  page  = std::max(1, std::stoi(req.url_params.get("page")));
+        if (req.url_params.get("limit")) limit = std::max(1, std::min(100, std::stoi(req.url_params.get("limit"))));
+        int offset = (page - 1) * limit;
+
+        std::string limit_s  = std::to_string(limit);
+        std::string offset_s = std::to_string(offset);
+
+        // Optional gender filter
+        const char* gender_param = req.url_params.get("gender");
+        std::string gender_s = gender_param ? gender_param : "";
+
+        std::lock_guard<std::mutex> lock(db_mutex);
+        PGresult* pgres;
+
+        if (!gender_s.empty() && (gender_s == "male" || gender_s == "female")) {
+            const char* params[] = { gender_s.c_str(), limit_s.c_str(), offset_s.c_str() };
+            pgres = PQexecParams(db,
+                "SELECT id, alias, gender, registered_at, has_completed_questionnaire "
+                "FROM users WHERE deleted_at IS NULL AND gender = $1::gender_type "
+                "ORDER BY registered_at DESC LIMIT $2::int OFFSET $3::int",
+                3, nullptr, params, nullptr, nullptr, 0);
+        } else {
+            const char* params[] = { limit_s.c_str(), offset_s.c_str() };
+            pgres = PQexecParams(db,
+                "SELECT id, alias, gender, registered_at, has_completed_questionnaire "
+                "FROM users WHERE deleted_at IS NULL "
+                "ORDER BY registered_at DESC LIMIT $1::int OFFSET $2::int",
+                2, nullptr, params, nullptr, nullptr, 0);
+        }
+
+        if (PQresultStatus(pgres) != PGRES_TUPLES_OK) {
+            PQclear(pgres);
+            crow::json::wvalue e; e["error"] = "query failed";
+            return crow::response(500, e);
+        }
+
+        crow::json::wvalue::list users;
+        int rows = PQntuples(pgres);
+        for (int i = 0; i < rows; ++i) {
+            crow::json::wvalue u;
+            u["id"]                       = std::stoll(PQgetvalue(pgres, i, 0));
+            u["alias"]                    = std::string(PQgetvalue(pgres, i, 1));
+            u["gender"]                   = std::string(PQgetvalue(pgres, i, 2));
+            u["registeredAt"]             = std::string(PQgetvalue(pgres, i, 3));
+            u["hasCompletedQuestionnaire"] = (std::string(PQgetvalue(pgres, i, 4)) == "t");
+            users.push_back(std::move(u));
+        }
+        PQclear(pgres);
+
+        crow::json::wvalue out;
+        out["users"] = std::move(users);
+        out["page"]  = page;
+        out["limit"] = limit;
+        return crow::response(200, out);
     });
 
     // GET /api/users/:id
     // Returns the public (anonymised) profile of participant :id.
-    // The "blind" part: real name is withheld until a mutual match is accepted.
-    CROW_ROUTE(app, "/api/users/<int>")([](int id){
-        // TODO: fetch user row from DB by id
-        // TODO: omit real name / contact details until match is accepted
-        // TODO: return { id, alias, bio, age, interests, compatibilityScore (if matched) }
-        crow::json::wvalue res;
-        res["id"]      = id;
-        res["message"] = "user profile endpoint — not yet wired to a database";
-        return crow::response(200, res);
+    // real_name, email, password_hash are never returned.
+    CROW_ROUTE(app, "/api/users/<int>")([&db, &db_mutex](int id){
+        std::string id_s = std::to_string(id);
+        const char* params[] = { id_s.c_str() };
+
+        std::lock_guard<std::mutex> lock(db_mutex);
+        PGresult* pgres = PQexecParams(db,
+            "SELECT id, alias, gender, age, bio, interests, has_completed_questionnaire "
+            "FROM users WHERE id = $1::bigint AND deleted_at IS NULL",
+            1, nullptr, params, nullptr, nullptr, 0);
+
+        if (PQresultStatus(pgres) != PGRES_TUPLES_OK || PQntuples(pgres) == 0) {
+            PQclear(pgres);
+            crow::json::wvalue e; e["error"] = "user not found";
+            return crow::response(404, e);
+        }
+
+        crow::json::wvalue out;
+        out["id"]                       = std::stoll(PQgetvalue(pgres, 0, 0));
+        out["alias"]                    = std::string(PQgetvalue(pgres, 0, 1));
+        out["gender"]                   = std::string(PQgetvalue(pgres, 0, 2));
+        out["age"]                      = std::stoi(PQgetvalue(pgres, 0, 3));
+        // bio and interests are CONFIDENTIAL — return only if not null (post-accept in future)
+        if (!PQgetisnull(pgres, 0, 4))
+            out["bio"]       = std::string(PQgetvalue(pgres, 0, 4));
+        if (!PQgetisnull(pgres, 0, 5))
+            out["interests"] = std::string(PQgetvalue(pgres, 0, 5));
+        out["hasCompletedQuestionnaire"] = (std::string(PQgetvalue(pgres, 0, 6)) == "t");
+        PQclear(pgres);
+        return crow::response(200, out);
     });
 
     // PUT /api/users/:id
-    // Body: any subset of { name, bio, interests, preferenceWeights }
-    // Updates the participant's editable profile fields.
+    // Body: any subset of { alias, bio, interests, age }
+    // updated_at is auto-touched by the set_updated_at trigger.
+    // TODO: verify JWT matches id (or is admin) for production
     CROW_ROUTE(app, "/api/users/<int>").methods(crow::HTTPMethod::PUT)(
-    [](const crow::request& req, int id){
-        // TODO: verify JWT matches id (or is admin)
-        // TODO: validate and merge changed fields
-        // TODO: if questionnaire answers changed, recompute compatibility scores
-        crow::json::wvalue res;
-        res["id"]      = id;
-        res["message"] = "update profile endpoint — not yet wired to a database";
-        return crow::response(200, res);
+    [&db, &db_mutex](const crow::request& req, int id){
+        auto body = crow::json::load(req.body);
+        if (!body)
+            return crow::response(400, "{\"error\":\"invalid JSON\"}");
+
+        // Build a dynamic SET clause from whichever fields are present
+        std::vector<std::string> clauses;
+        std::vector<std::string> values;
+
+        if (body.has("alias"))     { clauses.push_back("alias = $" + std::to_string(values.size()+1));     values.push_back(body["alias"].s()); }
+        if (body.has("bio"))       { clauses.push_back("bio = $" + std::to_string(values.size()+1));       values.push_back(body["bio"].s()); }
+        if (body.has("age")) {
+            int a = static_cast<int>(body["age"].i());
+            if (a < 18 || a > 120) {
+                crow::json::wvalue e; e["error"] = "age must be between 18 and 120";
+                return crow::response(400, e);
+            }
+            clauses.push_back("age = $" + std::to_string(values.size()+1) + "::smallint");
+            values.push_back(std::to_string(a));
+        }
+        if (body.has("interests")) {
+            std::string arr = "{";
+            bool first = true;
+            for (const auto& item : body["interests"]) {
+                if (!first) arr += ",";
+                arr += "\"" + std::string(item.s()) + "\"";
+                first = false;
+            }
+            arr += "}";
+            clauses.push_back("interests = $" + std::to_string(values.size()+1) + "::text[]");
+            values.push_back(arr);
+        }
+
+        if (clauses.empty()) {
+            crow::json::wvalue e; e["error"] = "no updatable fields provided";
+            return crow::response(400, e);
+        }
+
+        // Final param is the id
+        std::string id_s = std::to_string(id);
+        values.push_back(id_s);
+        std::string id_placeholder = "$" + std::to_string(values.size());
+
+        std::string sql = "UPDATE users SET ";
+        for (size_t i = 0; i < clauses.size(); ++i) {
+            if (i > 0) sql += ", ";
+            sql += clauses[i];
+        }
+        sql += " WHERE id = " + id_placeholder + "::bigint AND deleted_at IS NULL RETURNING id";
+
+        std::vector<const char*> params;
+        for (const auto& v : values) params.push_back(v.c_str());
+
+        std::lock_guard<std::mutex> lock(db_mutex);
+        PGresult* pgres = PQexecParams(db, sql.c_str(),
+            static_cast<int>(params.size()), nullptr, params.data(), nullptr, nullptr, 0);
+
+        if (PQresultStatus(pgres) != PGRES_TUPLES_OK || PQntuples(pgres) == 0) {
+            PQclear(pgres);
+            crow::json::wvalue e; e["error"] = "user not found or update failed";
+            return crow::response(404, e);
+        }
+        PQclear(pgres);
+
+        crow::json::wvalue out;
+        out["id"] = id;
+        out["updated"] = true;
+        return crow::response(200, out);
     });
 
     // DELETE /api/users/:id
-    // Permanently removes the account and all associated matches / messages.
+    // Two-step GDPR erasure: nullify PII columns then soft-delete.
+    // Child rows (matches, messages, etc.) are hard-deleted on a later
+    // hard-delete via ON DELETE CASCADE in the schema.
+    // TODO: verify JWT matches id (or admin) for production
     CROW_ROUTE(app, "/api/users/<int>").methods(crow::HTTPMethod::DELETE)(
-    [](const crow::request& req, int id){
-        // TODO: verify JWT matches id (or admin)
-        // TODO: cascade-delete matches, messages, event registrations
-        // TODO: remove personal data to comply with privacy regulations
-        crow::json::wvalue res;
-        res["id"]      = id;
-        res["message"] = "delete user endpoint — not yet wired to a database";
-        return crow::response(200, res);
+    [&db, &db_mutex](const crow::request& /*req*/, int id){
+        std::string id_s = std::to_string(id);
+        const char* params[] = { id_s.c_str() };
+
+        std::lock_guard<std::mutex> lock(db_mutex);
+
+        // Step 1: nullify PII to satisfy GDPR right-to-erasure
+        PGresult* pgres = PQexecParams(db,
+            "UPDATE users SET real_name = NULL, email = NULL, password_hash = NULL, "
+            "bio = NULL, interests = '{}' "
+            "WHERE id = $1::bigint AND deleted_at IS NULL",
+            1, nullptr, params, nullptr, nullptr, 0);
+
+        if (PQresultStatus(pgres) != PGRES_COMMAND_OK) {
+            PQclear(pgres);
+            crow::json::wvalue e; e["error"] = "delete failed";
+            return crow::response(500, e);
+        }
+        if (std::string(PQcmdTuples(pgres)) == "0") {
+            PQclear(pgres);
+            crow::json::wvalue e; e["error"] = "user not found";
+            return crow::response(404, e);
+        }
+        PQclear(pgres);
+
+        // Step 2: soft-delete
+        pgres = PQexecParams(db,
+            "UPDATE users SET deleted_at = NOW() WHERE id = $1::bigint",
+            1, nullptr, params, nullptr, nullptr, 0);
+
+        bool ok = (PQresultStatus(pgres) == PGRES_COMMAND_OK);
+        PQclear(pgres);
+        return ok ? crow::response(204) : crow::response(500);
     });
 
     // ── Compatibility Questionnaire ────────────────────────────────────────────
@@ -654,5 +935,6 @@ int main()
     uint16_t port = port_env ? static_cast<uint16_t>(std::stoi(port_env)) : 8081;
     std::cout << "Blind Dating API server listening on 0.0.0.0:" << port << "\n";
     app.port(port).bindaddr("0.0.0.0").multithreaded().run();
+    PQfinish(db);
     return 0;
 }
