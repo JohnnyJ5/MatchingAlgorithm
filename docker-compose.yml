@@ -6,15 +6,15 @@ services:
     ports:
       - "9090:9090"
     restart: unless-stopped
-    # environment:
-    #   - DB_HOST=db
-    #   - DB_PORT=5432
-    #   - DB_NAME=matching
-    #   - DB_USER=matching
-    #   - DB_PASSWORD=matching
-    # depends_on:
-    #   db:
-    #     condition: service_healthy
+    environment:
+      - DB_HOST=db
+      - DB_PORT=5432
+      - DB_NAME=${DB_NAME}
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+    depends_on:
+      db:
+        condition: service_healthy
 
   dev:
     build:
@@ -24,20 +24,21 @@ services:
       - .:/app
       - dev_build:/app/build   # isolated from host build/ to avoid CMakeCache path conflicts
 
-  # db:
-  #   image: postgres:16-alpine
-  #   environment:
-  #     POSTGRES_DB: matching
-  #     POSTGRES_USER: matching
-  #     POSTGRES_PASSWORD: matching
-  #   volumes:
-  #     - db_data:/var/lib/postgresql/data
-  #   healthcheck:
-  #     test: ["CMD-SHELL", "pg_isready -U matching"]
-  #     interval: 5s
-  #     timeout: 5s
-  #     retries: 5
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
 volumes:
   dev_build:
-  # db_data:
+  db_data:
