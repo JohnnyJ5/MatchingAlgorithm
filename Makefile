@@ -38,7 +38,7 @@ docker-build:
 
 docker-start:
 	docker compose up -d --build
-	@echo "Server running at http://localhost:9090"
+	@echo "Server running at http://localhost:8081"
 
 docker-stop:
 	docker compose down

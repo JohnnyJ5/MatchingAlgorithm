@@ -581,7 +581,7 @@ async function runAlgo(algo, btn) {
   } catch (err) {
     openModal('Error', `<p style="color:#fca5a5">Failed to reach the server: ${err.message}</p>
       <p style="color:var(--muted);font-size:0.85rem;margin-top:8px">
-        Make sure the Crow server is running on port 9090.</p>`);
+        Make sure the Crow server is running on port 8081.</p>`);
   } finally {
     btn.disabled = false;
     btn.innerHTML = original;

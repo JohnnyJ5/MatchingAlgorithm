@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Build & Run
 
-All commands run inside the Docker dev container. The `dev` service bind-mounts the project root at `/app`, so build artifacts land in `./build/` on the host.
+All commands run inside the Docker dev container. The `dev` service bind-mounts the project root at `/app`; build artifacts go into a named Docker volume (`dev_build`) that is **not** directly accessible from the host `./build/` directory.
+
+**Setup:** copy `.env.example` to `.env` (or set `DB_NAME`, `DB_USER`, `DB_PASSWORD` in environment) before starting the stack.
 
 ```bash
 # Build everything (main driver + server + all test binaries)
@@ -13,9 +15,9 @@ make all
 # Build and run the CLI comparative analysis
 make run
 
-# Start the web server (production image, port 9090)
+# Start the full stack (app + postgres), server at http://localhost:8081
 make run_server       # foreground via docker compose up app
-make docker-start     # detached; server at http://localhost:9090
+make docker-start     # detached
 make docker-stop
 
 # Build and run all unit tests
@@ -39,7 +41,7 @@ The project has two entry points sharing one algorithm library:
 - **`main.cpp`** — CLI tool that runs all four algorithms on a hardcoded 6×6 dataset and prints a side-by-side comparison.
 - **`server/server.cpp`** — Crow-based REST API + single-page web UI ("Spark") that exposes the same algorithms over HTTP on port 9090.
 
-Both duplicate the same 6×6 `COMPAT[man][woman]` score matrix and the same preference-building logic (sort columns descending to derive ordinal rankings from raw scores). When a database is added, this is the place to replace with queries.
+Both still contain a hardcoded 6×6 `COMPAT[man][woman]` score matrix and the same preference-building logic (sort columns descending to derive ordinal rankings from raw scores). **The PostgreSQL database has been added** (`db/schema.sql`, `compatibility_scores` table) — these hardcoded matrices are the primary place to replace with DB queries.
 
 ### Source Layout
 
@@ -55,6 +57,8 @@ server/
   server.cpp                      — REST API (Crow framework, ~656 lines)
   static/index.html               — Single-page app (embedded CSS + JS)
   BRANDING.md                     — UI design system reference
+db/
+  schema.sql                      — PostgreSQL 16 schema (users, matches, events, messages, scores)
 ```
 
 ### Module Summary
@@ -84,3 +88,16 @@ CMake is the build system; the `Makefile` is a thin wrapper that delegates to `d
 - `server/CMakeLists.txt` → `server` executable (links `algorithms` + Crow)
 
 `main.cpp` is built directly from the root `CMakeLists.txt` and links `algorithms`.
+
+### Database
+
+PostgreSQL 16 (`db` service in docker-compose). The schema is applied automatically from `db/schema.sql` on first container start. Key tables:
+
+- **`users`** — identity + profile; soft-deleted via `deleted_at`; PII columns (`real_name`, `email`, `password_hash`) are RESTRICTED
+- **`compatibility_scores`** — materialized N×N score matrix; the C++ algorithms read this instead of the hardcoded matrix
+- **`questionnaire_submissions`** — JSONB answer vectors; triggers score recomputation
+- **`algorithm_runs`** — caches JSONB algorithm output per event
+- **`matches`** — pending/accepted/declined pairings; `sync_match_status` trigger auto-sets `status='accepted'` when both flags are TRUE
+- **`messages`** — chat history between accepted matches; cursor-based pagination via PK
+
+Row Level Security is enabled on sensitive tables. The app sets `app.current_user_id` / `app.current_role` session variables to drive RLS policies.
