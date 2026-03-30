@@ -254,15 +254,16 @@ int main()
         " port="    + getenv_or("DB_PORT",     "5432") +
         " dbname="  + getenv_or("DB_NAME",     "")     +
         " user="    + getenv_or("DB_USER",     "")     +
-        " password="+ getenv_or("DB_PASSWORD", "");
+        " password="+ getenv_or("DB_PASSWORD", "")     +
+        " sslmode=" + getenv_or("DB_SSLMODE",  "prefer");
 
     PGconn* db = PQconnectdb(connStr.c_str());
     if (PQstatus(db) != CONNECTION_OK) {
-        std::cerr << "DB connect failed: " << PQerrorMessage(db) << "\n";
-        PQfinish(db);
-        return 1;
+        std::cerr << "WARNING: DB connect failed: " << PQerrorMessage(db) << "\n";
+        std::cerr << "The server will start, but database-dependent endpoints will return errors.\n";
+    } else {
+        std::cout << "Connected to PostgreSQL\n";
     }
-    std::cout << "Connected to PostgreSQL\n";
 
     // Serialises all DB access — libpq connections are not thread-safe.
     std::mutex db_mutex;
