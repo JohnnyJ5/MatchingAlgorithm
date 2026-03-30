@@ -31,6 +31,6 @@ WORKDIR /app
 COPY --from=builder /app/build/server ./build/server
 COPY --from=builder /app/server/static ./server/static
 
-EXPOSE 9090
+EXPOSE 8080
 
 CMD ["./build/server"]
