@@ -947,6 +947,11 @@ async function loadQuestionnaire() {
 
 async function submitQuestionnaire(event, version) {
   event.preventDefault();
+  const session = getSession();
+  if (!session) {
+    showToast('Please sign in before submitting.', 'error');
+    return;
+  }
   const btn = document.getElementById('qSubmitBtn');
   btn.disabled = true; btn.textContent = 'Submitting…';
   const inputs = document.querySelectorAll('#questionnaireForm .q-input');
@@ -956,7 +961,7 @@ async function submitQuestionnaire(event, version) {
               ? parseInt(inp.value, 10) : inp.value
   }));
   try {
-    const res = await fetch('/api/questionnaire/0', {
+    const res = await fetch(`/api/questionnaire/${session.userId}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ version, answers })

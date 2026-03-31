@@ -54,9 +54,11 @@
 #include <libpq-fe.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <mutex>
 #include <numeric>
 #include <sstream>
@@ -647,19 +649,260 @@ int main()
     // ── Compatibility Questionnaire ────────────────────────────────────────────
 
     // POST /api/questionnaire/:id
-    // Body: { "answers": [ { "questionId": int, "answer": int/string }, ... ] }
-    // Processes questionnaire responses and updates the compatibility matrix.
+    // Body: { "version": int, "answers": [ { "questionId": int, "answer": int/string }, ... ] }
+    // Persists answers, marks the user's questionnaire complete, and recomputes
+    // pairwise compatibility scores for all opposite-gender users who have submitted.
+    // Scoring: weighted Euclidean distance (normalised per question range), mapped to 0-100.
     CROW_ROUTE(app, "/api/questionnaire/<int>").methods(crow::HTTPMethod::POST)(
-    [](const crow::request& req, int userId){
-        // TODO: validate answers against question schema
-        // TODO: compute pair-wise compatibility scores using a scoring model
-        //       (e.g. weighted Euclidean distance over answer vectors)
-        // TODO: persist scores; mark user's questionnaire as complete
-        // TODO: trigger re-run of any cached algorithm results for active events
-        crow::json::wvalue res;
-        res["userId"]  = userId;
-        res["message"] = "questionnaire submission — not yet wired to scoring engine";
-        return crow::response(200, res);
+    [&db, &db_mutex](const crow::request& req, int userId){
+        auto body = crow::json::load(req.body);
+        if (!body || !body.has("answers") || !body.has("version")) {
+            crow::json::wvalue e; e["error"] = "version and answers are required";
+            return crow::response(400, e);
+        }
+
+        int version = body["version"].i();
+        auto& ans_json = body["answers"];
+
+        // Build answer map and JSONB string for storage
+        std::map<long long, double> submitter_answers;
+        std::ostringstream jsonb;
+        jsonb << "[";
+        bool first = true;
+        for (auto& a : ans_json) {
+            long long qid = a["questionId"].i();
+            if (!first) jsonb << ",";
+            first = false;
+            jsonb << "{\"questionId\":" << qid << ",\"answer\":";
+            try {
+                double val = static_cast<double>(a["answer"].i());
+                jsonb << static_cast<long long>(val);
+                submitter_answers[qid] = val;
+            } catch (...) {
+                std::string sval = a["answer"].s();
+                jsonb << "\"";
+                for (char c : sval) {
+                    if (c == '"' || c == '\\') jsonb << '\\';
+                    jsonb << c;
+                }
+                jsonb << "\"";
+            }
+            jsonb << "}";
+        }
+        jsonb << "]";
+        std::string answers_jsonb = jsonb.str();
+
+        std::string user_id_s = std::to_string(userId);
+        std::string version_s = std::to_string(version);
+
+        std::lock_guard<std::mutex> lock(db_mutex);
+
+        // 1. Get submitter's gender
+        const char* uid_param[] = { user_id_s.c_str() };
+        PGresult* ures = PQexecParams(db,
+            "SELECT gender FROM users WHERE id = $1 AND deleted_at IS NULL",
+            1, nullptr, uid_param, nullptr, nullptr, 0);
+        if (PQresultStatus(ures) != PGRES_TUPLES_OK || PQntuples(ures) == 0) {
+            PQclear(ures);
+            crow::json::wvalue e; e["error"] = "user not found";
+            return crow::response(404, e);
+        }
+        std::string gender = PQgetvalue(ures, 0, 0);
+        PQclear(ures);
+        std::string opposite_gender = (gender == "male") ? "female" : "male";
+
+        // 2. Fetch active questions for this version (weights + ranges for scoring)
+        const char* ver_param[] = { version_s.c_str() };
+        PGresult* qres = PQexecParams(db,
+            "SELECT id, answer_type, min_value, max_value, weight "
+            "FROM questions WHERE is_active = TRUE AND question_version = $1",
+            1, nullptr, ver_param, nullptr, nullptr, 0);
+        if (PQresultStatus(qres) != PGRES_TUPLES_OK) {
+            PQclear(qres);
+            crow::json::wvalue e; e["error"] = "failed to load questions";
+            return crow::response(500, e);
+        }
+        struct QuestionMeta { std::string type; double min, max, weight; };
+        std::map<long long, QuestionMeta> questions;
+        int qrows = PQntuples(qres);
+        for (int i = 0; i < qrows; ++i) {
+            long long qid = std::stoll(PQgetvalue(qres, i, 0));
+            QuestionMeta m;
+            m.type   = PQgetvalue(qres, i, 1);
+            m.min    = PQgetisnull(qres, i, 2) ? 1.0  : std::stod(PQgetvalue(qres, i, 2));
+            m.max    = PQgetisnull(qres, i, 3) ? 10.0 : std::stod(PQgetvalue(qres, i, 3));
+            m.weight = std::stod(PQgetvalue(qres, i, 4));
+            questions[qid] = m;
+        }
+        PQclear(qres);
+
+        // Validate submitted answer IDs against known questions
+        for (auto& kv : submitter_answers) {
+            if (questions.find(kv.first) == questions.end()) {
+                crow::json::wvalue e;
+                e["error"] = "unknown questionId: " + std::to_string(kv.first);
+                return crow::response(400, e);
+            }
+        }
+
+        // 3. Persist submission in a transaction
+        PQexec(db, "BEGIN");
+
+        // Deactivate previous current submission for this user/version
+        const char* deact_params[] = { user_id_s.c_str(), version_s.c_str() };
+        PGresult* dr = PQexecParams(db,
+            "UPDATE questionnaire_submissions "
+            "SET is_current = FALSE "
+            "WHERE user_id = $1 AND question_version = $2 AND is_current = TRUE",
+            2, nullptr, deact_params, nullptr, nullptr, 0);
+        if (PQresultStatus(dr) != PGRES_COMMAND_OK) {
+            PQclear(dr); PQexec(db, "ROLLBACK");
+            crow::json::wvalue e; e["error"] = "failed to deactivate old submission";
+            return crow::response(500, e);
+        }
+        PQclear(dr);
+
+        // Insert new submission
+        const char* ins_params[] = {
+            user_id_s.c_str(), version_s.c_str(), answers_jsonb.c_str()
+        };
+        PGresult* ir = PQexecParams(db,
+            "INSERT INTO questionnaire_submissions (user_id, question_version, answers) "
+            "VALUES ($1, $2, $3::jsonb) RETURNING id",
+            3, nullptr, ins_params, nullptr, nullptr, 0);
+        if (PQresultStatus(ir) != PGRES_TUPLES_OK) {
+            PQclear(ir); PQexec(db, "ROLLBACK");
+            crow::json::wvalue e; e["error"] = "failed to insert submission";
+            return crow::response(500, e);
+        }
+        long long submission_id = std::stoll(PQgetvalue(ir, 0, 0));
+        std::string submission_id_s = std::to_string(submission_id);
+        PQclear(ir);
+
+        // Mark user as having completed the questionnaire
+        PGresult* ur = PQexecParams(db,
+            "UPDATE users SET has_completed_questionnaire = TRUE WHERE id = $1",
+            1, nullptr, uid_param, nullptr, nullptr, 0);
+        if (PQresultStatus(ur) != PGRES_COMMAND_OK) {
+            PQclear(ur); PQexec(db, "ROLLBACK");
+            crow::json::wvalue e; e["error"] = "failed to update user status";
+            return crow::response(500, e);
+        }
+        PQclear(ur);
+
+        PQexec(db, "COMMIT");
+
+        // 4. Compute pairwise scores against all opposite-gender current submissions
+        const char* opp_params[] = { version_s.c_str(), opposite_gender.c_str() };
+        PGresult* opp = PQexecParams(db,
+            "SELECT qs.user_id, qs.id, qs.answers "
+            "FROM questionnaire_submissions qs "
+            "JOIN users u ON u.id = qs.user_id "
+            "WHERE qs.is_current = TRUE "
+            "  AND qs.question_version = $1 "
+            "  AND u.gender = $2 "
+            "  AND u.deleted_at IS NULL",
+            2, nullptr, opp_params, nullptr, nullptr, 0);
+        if (PQresultStatus(opp) != PGRES_TUPLES_OK) {
+            PQclear(opp);
+            crow::json::wvalue out;
+            out["userId"]        = userId;
+            out["submissionId"]  = submission_id;
+            out["scoresUpdated"] = 0;
+            out["warning"]       = "score computation skipped: could not fetch peers";
+            return crow::response(200, out);
+        }
+
+        // Precompute total weight for normalisation
+        double total_weight = 0.0;
+        for (auto& kv : questions) {
+            if (kv.second.type == "scale" || kv.second.type == "integer")
+                total_weight += kv.second.weight;
+        }
+
+        int opp_rows = PQntuples(opp);
+        int scores_updated = 0;
+
+        for (int r = 0; r < opp_rows; ++r) {
+            long long peer_uid    = std::stoll(PQgetvalue(opp, r, 0));
+            long long peer_sub_id = std::stoll(PQgetvalue(opp, r, 1));
+            std::string peer_jsonb = PQgetvalue(opp, r, 2);
+
+            // Parse peer answer vector via a DB round-trip (avoids a JSON parser)
+            std::map<long long, double> peer_answers;
+            {
+                const char* jp[] = { peer_jsonb.c_str() };
+                PGresult* jp_res = PQexecParams(db,
+                    "SELECT elem->>'questionId', elem->>'answer' "
+                    "FROM jsonb_array_elements($1::jsonb) AS elem",
+                    1, nullptr, jp, nullptr, nullptr, 0);
+                if (PQresultStatus(jp_res) == PGRES_TUPLES_OK) {
+                    int jp_rows = PQntuples(jp_res);
+                    for (int j = 0; j < jp_rows; ++j) {
+                        long long qid = std::stoll(PQgetvalue(jp_res, j, 0));
+                        const char* av = PQgetvalue(jp_res, j, 1);
+                        if (av && av[0]) { try { peer_answers[qid] = std::stod(av); } catch (...) {} }
+                    }
+                }
+                PQclear(jp_res);
+            }
+
+            // Weighted normalised Euclidean distance → score 0-100
+            double sq_sum = 0.0;
+            for (auto& kv : questions) {
+                long long qid = kv.first;
+                auto& meta    = kv.second;
+                if (meta.type != "scale" && meta.type != "integer") continue;
+                double range  = meta.max - meta.min;
+                if (range <= 0) continue;
+                double a_val  = submitter_answers.count(qid) ? submitter_answers.at(qid) : meta.min;
+                double b_val  = peer_answers.count(qid)      ? peer_answers.at(qid)      : meta.min;
+                double nd     = (a_val - b_val) / range;
+                sq_sum       += meta.weight * nd * nd;
+            }
+            double distance = (total_weight > 0) ? std::sqrt(sq_sum / total_weight) : 0.0;
+            int score = static_cast<int>(std::round((1.0 - distance) * 100.0));
+            score = std::max(0, std::min(100, score));
+
+            long long man_id, woman_id, man_sub, woman_sub;
+            if (gender == "male") {
+                man_id   = userId;       woman_id  = peer_uid;
+                man_sub  = submission_id; woman_sub = peer_sub_id;
+            } else {
+                man_id   = peer_uid;     woman_id  = userId;
+                man_sub  = peer_sub_id;  woman_sub = submission_id;
+            }
+
+            std::string man_id_s    = std::to_string(man_id);
+            std::string woman_id_s  = std::to_string(woman_id);
+            std::string score_s     = std::to_string(score);
+            std::string man_sub_s   = std::to_string(man_sub);
+            std::string woman_sub_s = std::to_string(woman_sub);
+
+            const char* sc_params[] = {
+                man_id_s.c_str(), woman_id_s.c_str(), score_s.c_str(),
+                man_sub_s.c_str(), woman_sub_s.c_str()
+            };
+            PGresult* sc = PQexecParams(db,
+                "INSERT INTO compatibility_scores "
+                "  (man_id, woman_id, score, man_submission_id, woman_submission_id) "
+                "VALUES ($1, $2, $3, $4, $5) "
+                "ON CONFLICT (man_id, woman_id) DO UPDATE "
+                "  SET score = EXCLUDED.score, "
+                "      computed_at = NOW(), "
+                "      man_submission_id   = EXCLUDED.man_submission_id, "
+                "      woman_submission_id = EXCLUDED.woman_submission_id",
+                5, nullptr, sc_params, nullptr, nullptr, 0);
+            if (PQresultStatus(sc) == PGRES_COMMAND_OK) ++scores_updated;
+            PQclear(sc);
+        }
+        PQclear(opp);
+
+        crow::json::wvalue out;
+        out["userId"]        = userId;
+        out["submissionId"]  = submission_id;
+        out["scoresUpdated"] = scores_updated;
+        return crow::response(200, out);
     });
 
     // GET /api/questions
