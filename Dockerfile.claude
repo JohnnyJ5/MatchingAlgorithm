@@ -1,0 +1,42 @@
+FROM debian:bookworm-slim
+
+# Bypass interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Update and install dependencies necessary for the Claude CLI as well as
+# building/testing the underlying C++ Crow application in this repository.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    ca-certificates \
+    g++ \
+    git \
+    make \
+    cmake \
+    libasio-dev \
+    libpq-dev \
+    openssh-client \
+    unzip \
+    nodejs \
+    npm \
+    python3 \
+    sudo \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Anthropic's Claude CLI
+RUN npm install -g @anthropic-ai/claude-code || curl -fsSL https://claude.ai/install.sh | bash
+
+# Alias Claude to always skip permissions across the whole container
+RUN echo "alias claude-yolo='claude --dangerously-skip-permissions'" >> /etc/bash.bashrc
+
+# Create a non-root user to run Claude (with sudo privileges just in case)
+RUN useradd -m -u 1000 -s /bin/bash claude && \
+    echo "claude ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+
+# Switch to the non-root user
+USER claude
+
+# Set the working directory where the repository should be mounted
+WORKDIR /app
+
+# Ensure we have a default command that drops the user into an interactive shell
+CMD ["/bin/bash"]
