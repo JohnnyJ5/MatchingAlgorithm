@@ -560,3 +560,26 @@ JOIN users woman ON woman.id = m.woman_id AND woman.deleted_at IS NULL;
 -- The application should only expose real_name after BOTH accepted_by_man
 -- AND accepted_by_woman are TRUE, and should do so via a separate,
 -- access-controlled endpoint, not via this view.
+
+-- ---------------------------------------------------------------------------
+-- SEED: questionnaire questions (version 1)
+-- ---------------------------------------------------------------------------
+INSERT INTO questions
+    (question_version, question_text, answer_type, min_value, max_value, weight, display_order)
+VALUES
+    (1, 'How much do you value shared hobbies and activities with a partner?',
+        'scale', 1, 10, 1.2000, 1),
+    (1, 'How often do you enjoy socialising with large groups of people?',
+        'scale', 1, 10, 0.8000, 2),
+    (1, 'How important is physical fitness or an active lifestyle to you?',
+        'scale', 1, 10, 0.9000, 3),
+    (1, 'How much do you prioritise intellectual conversation in a relationship?',
+        'scale', 1, 10, 1.1000, 4),
+    (1, 'How important is it that your partner shares your religious or spiritual beliefs?',
+        'scale', 1, 10, 1.3000, 5),
+    (1, 'How strongly do you want children in the future?',
+        'scale', 1, 10, 1.5000, 6),
+    (1, 'How adventurous are you when it comes to travel and new experiences?',
+        'scale', 1, 10, 0.7000, 7),
+    (1, 'In a relationship, how much personal space and independence do you need?',
+        'scale', 1, 10, 1.0000, 8);

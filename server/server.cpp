@@ -662,6 +662,70 @@ int main()
         return crow::response(200, res);
     });
 
+    // GET /api/questions
+    // Returns all active questions for the current questionnaire version,
+    // sorted by display_order.
+    // Response: { "version": int, "questions": [ { "id", "text", "answerType",
+    //             "minValue", "maxValue", "weight", "order" } ] }
+    CROW_ROUTE(app, "/api/questions")([&db, &db_mutex](){
+        std::lock_guard<std::mutex> lock(db_mutex);
+
+        // Find the highest active question version.
+        PGresult* vres = PQexecParams(db,
+            "SELECT MAX(question_version) FROM questions WHERE is_active = TRUE",
+            0, nullptr, nullptr, nullptr, nullptr, 0);
+
+        if (PQresultStatus(vres) != PGRES_TUPLES_OK || PQgetisnull(vres, 0, 0)) {
+            PQclear(vres);
+            crow::json::wvalue out;
+            out["version"]   = 0;
+            out["questions"] = crow::json::wvalue::list{};
+            return crow::response(200, out);
+        }
+
+        std::string ver_str = PQgetvalue(vres, 0, 0);
+        PQclear(vres);
+        const char* ver_param[] = { ver_str.c_str() };
+
+        PGresult* qres = PQexecParams(db,
+            "SELECT id, question_text, answer_type, "
+            "       min_value, max_value, weight, display_order "
+            "FROM questions "
+            "WHERE is_active = TRUE AND question_version = $1 "
+            "ORDER BY display_order ASC",
+            1, nullptr, ver_param, nullptr, nullptr, 0);
+
+        if (PQresultStatus(qres) != PGRES_TUPLES_OK) {
+            PQclear(qres);
+            crow::json::wvalue e; e["error"] = "database query failed";
+            return crow::response(500, e);
+        }
+
+        int rows = PQntuples(qres);
+        crow::json::wvalue::list questions;
+        for (int i = 0; i < rows; ++i) {
+            crow::json::wvalue q;
+            q["id"]         = std::stoll(PQgetvalue(qres, i, 0));
+            q["text"]       = std::string(PQgetvalue(qres, i, 1));
+            q["answerType"] = std::string(PQgetvalue(qres, i, 2));
+            q["minValue"]   = PQgetisnull(qres, i, 3)
+                                  ? crow::json::wvalue(nullptr)
+                                  : crow::json::wvalue(std::stoi(PQgetvalue(qres, i, 3)));
+            q["maxValue"]   = PQgetisnull(qres, i, 4)
+                                  ? crow::json::wvalue(nullptr)
+                                  : crow::json::wvalue(std::stoi(PQgetvalue(qres, i, 4)));
+            q["weight"]     = std::stod(PQgetvalue(qres, i, 5));
+            q["order"]      = std::stoi(PQgetvalue(qres, i, 6));
+            questions.push_back(std::move(q));
+        }
+        PQclear(qres);
+
+        crow::json::wvalue out;
+        out["version"]   = std::stoi(ver_str);
+        out["questions"] = std::move(questions);
+        return crow::response(200, out);
+    });
+
     // GET /api/compatibility
     // Returns the full n×n compatibility score matrix (admin / debug only).
     // In production this should be gated behind admin auth.

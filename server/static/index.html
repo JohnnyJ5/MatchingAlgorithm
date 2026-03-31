@@ -352,6 +352,34 @@
     .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
     .toast.success { border-color: rgba(16,185,129,0.4); color: #6ee7b7; }
     .toast.error   { border-color: rgba(239,68,68,0.4);  color: #fca5a5; }
+
+    /* ── Questionnaire ────────────────────────────────────────── */
+    .question-list { display: flex; flex-direction: column; gap: 20px; margin-bottom: 28px; }
+    .question-item {
+      background: var(--card); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 20px 24px;
+    }
+    .question-text { font-size: 0.95rem; font-weight: 600; margin-bottom: 14px; line-height: 1.45; }
+    .question-meta { font-size: 0.75rem; color: var(--muted); margin-bottom: 8px; }
+    .scale-wrap { display: flex; align-items: center; gap: 12px; }
+    .scale-wrap input[type="range"] { flex: 1; accent-color: var(--pink); cursor: pointer; }
+    .scale-val { min-width: 28px; text-align: center; font-weight: 700; color: var(--pink); }
+    .q-input {
+      width: 100%; background: var(--glass); border: 1px solid var(--border);
+      border-radius: 10px; color: var(--text); padding: 10px 14px; font-size: 0.9rem;
+      outline: none; transition: border-color 0.2s;
+    }
+    .q-input:focus { border-color: rgba(255,77,125,0.5); }
+    .q-loading, .q-error { text-align: center; padding: 40px 24px; color: var(--muted); font-size: 0.9rem; }
+    .q-error { color: #fca5a5; }
+    .questionnaire-submit {
+      display: block; width: 100%; padding: 13px; border-radius: 12px;
+      background: linear-gradient(135deg, var(--pink), var(--purple));
+      color: #fff; font-weight: 700; font-size: 0.95rem;
+      border: none; cursor: pointer; transition: all 0.2s;
+    }
+    .questionnaire-submit:hover { opacity: 0.9; transform: translateY(-1px); }
+    .questionnaire-submit:disabled { opacity: 0.5; cursor: wait; }
   </style>
 </head>
 <body>
@@ -363,6 +391,7 @@
     <a href="#">Profiles</a>
     <a href="#">Events</a>
     <a href="#">Matches</a>
+    <a href="#questionnaire">Questionnaire</a>
     <a href="#algorithms">Algorithms</a>
     <a href="#" class="btn-login" id="navAuthBtn" onclick="openAuthModal(); return false;">Sign In</a>
   </div>
@@ -387,6 +416,17 @@
   </div>
   <div class="profile-grid" id="profileGrid">
     <!-- Populated by JS -->
+  </div>
+</section>
+
+<!-- ── Compatibility Questionnaire ──────────────────────────────────────────── -->
+<section class="section container" id="questionnaire">
+  <div class="section-header">
+    <h2>Compatibility Questionnaire</h2>
+    <p>Answer honestly — your responses power the matching algorithms</p>
+  </div>
+  <div id="questionnaireContent">
+    <div class="q-loading">Loading questions…</div>
   </div>
 </section>
 
@@ -854,6 +894,88 @@ async function runCompare(btn) {
     btn.innerHTML = original;
   }
 }
+
+// ── Questionnaire ─────────────────────────────────────────────────────────────
+async function loadQuestionnaire() {
+  const container = document.getElementById('questionnaireContent');
+  try {
+    const res = await fetch('/api/questions');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+
+    if (!data.questions || data.questions.length === 0) {
+      container.innerHTML = '<div class="q-error">No active questions found.</div>';
+      return;
+    }
+
+    const items = data.questions.map(q => {
+      let inputHtml;
+      if (q.answerType === 'scale') {
+        const min = q.minValue ?? 1, max = q.maxValue ?? 10;
+        const mid = Math.round((min + max) / 2);
+        inputHtml = `<div class="scale-wrap">
+          <span style="color:var(--muted);font-size:0.78rem">${min}</span>
+          <input type="range" class="q-input" id="q_${q.id}" min="${min}" max="${max}" value="${mid}"
+                 oninput="document.getElementById('qv_${q.id}').textContent=this.value">
+          <span style="color:var(--muted);font-size:0.78rem">${max}</span>
+          <span class="scale-val" id="qv_${q.id}">${mid}</span>
+        </div>`;
+      } else if (q.answerType === 'integer') {
+        const min = q.minValue ?? 0, max = q.maxValue ?? 100;
+        inputHtml = `<input type="number" class="q-input" id="q_${q.id}"
+                            min="${min}" max="${max}" placeholder="${min}–${max}">`;
+      } else {
+        inputHtml = `<input type="text" class="q-input" id="q_${q.id}"
+                            placeholder="Your answer…" maxlength="500">`;
+      }
+      return `<div class="question-item">
+        <div class="question-meta">Q${q.order} · ${q.answerType}</div>
+        <div class="question-text">${q.text}</div>
+        ${inputHtml}
+      </div>`;
+    }).join('');
+
+    container.innerHTML = `
+      <form id="questionnaireForm" onsubmit="submitQuestionnaire(event,${data.version})">
+        <div class="question-list">${items}</div>
+        <button type="submit" class="questionnaire-submit" id="qSubmitBtn">Submit Answers</button>
+      </form>`;
+  } catch (err) {
+    container.innerHTML = `<div class="q-error">Failed to load questions: ${err.message}</div>`;
+  }
+}
+
+async function submitQuestionnaire(event, version) {
+  event.preventDefault();
+  const btn = document.getElementById('qSubmitBtn');
+  btn.disabled = true; btn.textContent = 'Submitting…';
+  const inputs = document.querySelectorAll('#questionnaireForm .q-input');
+  const answers = Array.from(inputs).map(inp => ({
+    questionId: parseInt(inp.id.replace('q_', ''), 10),
+    answer: inp.type === 'range' || inp.type === 'number'
+              ? parseInt(inp.value, 10) : inp.value
+  }));
+  try {
+    const res = await fetch('/api/questionnaire/0', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ version, answers })
+    });
+    btn.textContent = res.ok ? 'Submitted ✓' : 'Submit failed';
+    btn.style.background = res.ok
+      ? 'linear-gradient(135deg,#10b981,#34d399)'
+      : 'linear-gradient(135deg,#ef4444,#f87171)';
+  } catch (err) {
+    btn.textContent = 'Network error';
+    btn.style.background = 'linear-gradient(135deg,#ef4444,#f87171)';
+  } finally {
+    setTimeout(() => {
+      btn.disabled = false; btn.textContent = 'Submit Answers'; btn.style.background = '';
+    }, 3000);
+  }
+}
+
+loadQuestionnaire();
 </script>
 </body>
 </html>
