@@ -158,41 +158,29 @@ static std::string getenv_or(const char* name, const char* fallback)
     return v ? v : fallback;
 }
 
-// ── DBManager — pqxx connection for questionnaire endpoints ──────────────────
-// Assembles the connection string from the same env vars as the libpq block
-// in main(). A single global mutex serialises all pqxx transactions because
-// Crow is multithreaded and a single pqxx::connection is not thread-safe.
+// ── pqxx helpers ─────────────────────────────────────────────────────────────
+// Each Crow handler runs in its own thread. pqxx::connection is not thread-safe
+// so each request opens its own connection. Concurrency is handled at the DB
+// level via transaction isolation, not with application-side mutexes.
 
-static std::mutex pqxxMutex;
+static std::string pqConnStr()
+{
+    return "host="     + getenv_or("DB_HOST",     "db")   +
+           " port="    + getenv_or("DB_PORT",     "5432") +
+           " dbname="  + getenv_or("DB_NAME",     "")     +
+           " user="    + getenv_or("DB_USER",     "")     +
+           " password="+ getenv_or("DB_PASSWORD", "")     +
+           " sslmode=" + getenv_or("DB_SSLMODE",  "prefer");
+}
 
-class DBManager {
-public:
-    DBManager()
-        : conn_(
-            "host="     + getenv_or("DB_HOST",     "db")   +
-            " port="    + getenv_or("DB_PORT",     "5432") +
-            " dbname="  + getenv_or("DB_NAME",     "")     +
-            " user="    + getenv_or("DB_USER",     "")     +
-            " password="+ getenv_or("DB_PASSWORD", "")     +
-            " sslmode=" + getenv_or("DB_SSLMODE",  "prefer"))
-    {}
-
-    pqxx::connection& conn() { return conn_; }
-
-    // Set session-level RLS variables so policies can identify the caller.
-    void setSessionRole(pqxx::transaction_base& txn,
-                        const std::string& role,
-                        long long userId)
-    {
-        txn.exec("SET LOCAL app.current_role = " + txn.quote(role));
-        txn.exec("SET LOCAL app.current_user_id = " + txn.quote(std::to_string(userId)));
-    }
-
-private:
-    pqxx::connection conn_;
-};
-
-static DBManager* g_db = nullptr;   // initialised in main()
+// Set session-level RLS variables so policies can identify the caller.
+static void setSessionRole(pqxx::transaction_base& txn,
+                           const std::string& role,
+                           long long userId)
+{
+    txn.exec("SET LOCAL app.current_role = " + txn.quote(role));
+    txn.exec("SET LOCAL app.current_user_id = " + txn.quote(std::to_string(userId)));
+}
 
 // ── Scoring helper ────────────────────────────────────────────────────────────
 // Weighted Euclidean distance between two answer vectors; normalised to 0-100.
@@ -329,16 +317,6 @@ int main()
 
     // Serialises all DB access — libpq connections are not thread-safe.
     std::mutex db_mutex;
-
-    // ── pqxx connection for questionnaire/questions/compatibility endpoints ──
-    try {
-        g_db = new DBManager();
-        std::cout << "pqxx connection established\n";
-    } catch (const std::exception& ex) {
-        std::cerr << "WARNING: pqxx connect failed: " << ex.what() << "\n";
-        std::cerr << "Questionnaire endpoints will return 503 until DB is available.\n";
-        g_db = nullptr;
-    }
 
     crow::SimpleApp app;
 
@@ -721,14 +699,11 @@ int main()
     // GET /api/questions
     // Returns all active questions for the current questionnaire version.
     CROW_ROUTE(app, "/api/questions")([](){
-        if (!g_db) {
-            crow::json::wvalue e; e["error"] = "database unavailable";
-            return crow::response(503, e);
-        }
         try {
-            std::lock_guard<std::mutex> lock(pqxxMutex);
-            pqxx::work txn(g_db->conn());
-            g_db->setSessionRole(txn, "scoring_service", 0);
+            pqxx::connection conn(pqConnStr());
+            // Read-only snapshot — serializable so the question set is consistent.
+            pqxx::read_transaction txn(conn);
+            setSessionRole(txn, "scoring_service", 0);
             auto rows = txn.exec(
                 "SELECT id, question_text, answer_type, min_value, max_value, "
                 "       weight, display_order, question_version "
@@ -762,13 +737,11 @@ int main()
     // POST /api/questionnaire/:id
     // Body: { "answers": [ { "questionId": int, "answer": int/string }, ... ] }
     // Stores answers, computes pair-wise compatibility scores, updates DB.
+    // Uses SERIALIZABLE isolation: we read all current submissions, compute scores,
+    // then write — serializable ensures no concurrent submission can produce an
+    // inconsistent score matrix (the DB will abort and the client can retry).
     CROW_ROUTE(app, "/api/questionnaire/<int>").methods(crow::HTTPMethod::POST)(
     [](const crow::request& req, int userId){
-        if (!g_db) {
-            crow::json::wvalue e; e["error"] = "database unavailable";
-            return crow::response(503, e);
-        }
-
         auto body = crow::json::load(req.body);
         if (!body || !body.has("answers") || body["answers"].t() != crow::json::type::List) {
             crow::json::wvalue e; e["error"] = "body must be {\"answers\":[...]}";
@@ -776,9 +749,12 @@ int main()
         }
 
         try {
-            std::lock_guard<std::mutex> lock(pqxxMutex);
-            pqxx::work txn(g_db->conn());
-            g_db->setSessionRole(txn, "scoring_service", static_cast<long long>(userId));
+            pqxx::connection conn(pqConnStr());
+            // SERIALIZABLE: we read other users' submissions and write scores in one
+            // atomic view. If two users submit concurrently, PostgreSQL serializes them
+            // correctly and aborts/retries whichever transaction conflicts.
+            pqxx::transaction<pqxx::isolation_level::serializable> txn(conn);
+            setSessionRole(txn, "scoring_service", static_cast<long long>(userId));
 
             // Step 1: load active questions
             auto qrows = txn.exec(
@@ -968,40 +944,17 @@ int main()
     // Falls back to hardcoded data if no scores exist yet.
     // In production this should be gated behind admin auth.
     CROW_ROUTE(app, "/api/compatibility")([](){
-        if (!g_db) {
-            // Fallback: hardcoded matrix
-            crow::json::wvalue res;
-            crow::json::wvalue::list matrix;
-            for (int m = 0; m < N; ++m) {
-                crow::json::wvalue row;
-                row["man"] = MEN[m];
-                crow::json::wvalue::list scores;
-                for (int w = 0; w < N; ++w) {
-                    crow::json::wvalue entry;
-                    entry["woman"] = WOMEN[w];
-                    entry["score"] = COMPAT[m][w];
-                    scores.push_back(std::move(entry));
-                }
-                row["scores"] = std::move(scores);
-                matrix.push_back(std::move(row));
-            }
-            res["matrix"]    = std::move(matrix);
-            res["threshold"] = THRESHOLD;
-            res["n"]         = N;
-            res["source"]    = "hardcoded";
-            return crow::response(200, res);
-        }
         try {
-            std::lock_guard<std::mutex> lock(pqxxMutex);
-            pqxx::work txn(g_db->conn());
-            g_db->setSessionRole(txn, "scoring_service", 0);
+            pqxx::connection conn(pqConnStr());
+            // Read-only snapshot of the score matrix; serializable for consistency.
+            pqxx::read_transaction txn(conn);
+            setSessionRole(txn, "scoring_service", 0);
             auto rows = txn.exec(
                 "SELECT m.alias, m.id, w.alias, w.id, cs.score "
                 "FROM compatibility_scores cs "
                 "JOIN users m ON m.id = cs.man_id "
                 "JOIN users w ON w.id = cs.woman_id "
                 "ORDER BY m.id, w.id");
-            txn.commit();
 
             if (rows.empty()) {
                 // No live data yet — return hardcoded matrix
