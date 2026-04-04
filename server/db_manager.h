@@ -1,24 +1,20 @@
 // db_manager.h — PostgreSQL access layer.
 //
 // All SQL lives here; server.cpp never touches libpq directly.
-// Each method acquires a connection from a small pool, executes the query,
-// maps the result to a typed struct, and releases the connection via RAII.
+// Each method acquires a connection from ConnPool, executes the query,
+// maps the result to a typed struct, and releases the connection via RAII
+// (ConnGuard destructor).
 //
-// Thread safety: the connection pool is guarded by a mutex + condition variable.
-// Each request handler gets its own connection for the duration of its DB call;
-// concurrent handlers never share a connection.
+// Thread safety: ConnPool is thread-safe.  Each request handler gets its own
+// ConnGuard for the duration of its DB call; concurrent handlers never share
+// a connection.
 #pragma once
 
+#include "conn_pool.h"
 #include "db_types.h"
 
-#include <libpq-fe.h>
-
-#include <chrono>
-#include <condition_variable>
 #include <cstdint>
-#include <mutex>
 #include <optional>
-#include <queue>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -28,10 +24,11 @@ public:
     // Connects poolSize libpq connections using connStr.
     // Logs a warning for any connection that fails; the server continues with
     // the successfully-connected subset (partial degradation).
+    // Opens poolSize connections via ConnPool.  Logs a warning when fewer
+    // connections succeed; the server continues with partial degradation.
     explicit DBManager(std::string_view connStr, int poolSize = 4);
 
-    // Closes all pooled connections via PQfinish.
-    ~DBManager();
+    ~DBManager() = default;
 
     DBManager(const DBManager&)            = delete;
     DBManager& operator=(const DBManager&) = delete;
@@ -179,32 +176,8 @@ public:
         std::string_view text);
 
 private:
-    // RAII guard that returns a connection to the pool on destruction.
-    struct ConnGuard {
-        DBManager* mgr  = nullptr;
-        PGconn*    conn = nullptr;
-
-        ConnGuard(DBManager* m, PGconn* c) noexcept : mgr(m), conn(c) {}
-        ~ConnGuard() noexcept { if (mgr && conn) mgr->release(conn); }
-
-        ConnGuard(const ConnGuard&)            = delete;
-        ConnGuard& operator=(const ConnGuard&) = delete;
-
-        ConnGuard(ConnGuard&& o) noexcept
-            : mgr(o.mgr), conn(o.conn) { o.mgr = nullptr; o.conn = nullptr; }
-    };
-
-    // Blocks until a connection is available (5 s timeout).
-    // Returns InternalError on timeout.
-    [[nodiscard]] ConnGuard acquire();
-    void release(PGconn* conn) noexcept;
-
     // Maps SQLSTATE string → DbErrc for uniform error reporting.
     static DbErrc mapSqlState(const char* sqlstate) noexcept;
 
-    std::vector<PGconn*>    d_pool;
-    std::queue<PGconn*>     d_available;
-    std::mutex              d_poolMutex;
-    std::condition_variable d_poolCv;
-    std::string             d_connStr;
+    ConnPool d_pool_;
 };

@@ -46,6 +46,7 @@
 
 #include "crow.h"
 #include "db_manager.h"
+#include "thread_pool.h"
 
 #include "../src/gale_shapley.h"
 #include "../src/hopcroft_karp.h"
@@ -272,6 +273,9 @@ int main()
     }();
 
     DBManager db(connStr, poolSize);
+
+    // Background thread pool for async work (algorithm re-runs, notifications).
+    ThreadPool<> bgPool(2);
 
     crow::SimpleApp app;
 

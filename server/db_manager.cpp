@@ -1,9 +1,7 @@
 #include "db_manager.h"
 
-#include <iostream>
 #include <optional>
 #include <sstream>
-#include <stdexcept>
 #include <string>
 
 // ── Internal RAII helper ──────────────────────────────────────────────────────
@@ -61,67 +59,11 @@ bool pgGetBool(PGresult* res, int row, int col) {
 
 } // namespace
 
-// ── Construction / Destruction ────────────────────────────────────────────────
+// ── Construction ─────────────────────────────────────────────────────────────
 
 DBManager::DBManager(std::string_view connStr, int poolSize)
-    : d_connStr(connStr)
-{
-    for (int i = 0; i < poolSize; ++i) {
-        PGconn* conn = PQconnectdb(d_connStr.c_str());
-        if (PQstatus(conn) != CONNECTION_OK) {
-            std::cerr << "DBManager: pool[" << i << "] connect failed: "
-                      << PQerrorMessage(conn) << "\n";
-            PQfinish(conn);
-            continue;
-        }
-        d_pool.push_back(conn);
-        d_available.push(conn);
-    }
-    if (d_pool.empty()) {
-        std::cerr << "DBManager: WARNING — no DB connections available; "
-                     "all database endpoints will return errors.\n";
-    } else {
-        std::cout << "DBManager: pool ready (" << d_pool.size() << " connection(s))\n";
-    }
-}
-
-DBManager::~DBManager() {
-    // Drain the available queue; d_pool owns the canonical pointer list.
-    for (PGconn* conn : d_pool) {
-        PQfinish(conn);
-    }
-}
-
-// ── Pool management ───────────────────────────────────────────────────────────
-
-DBManager::ConnGuard DBManager::acquire() {
-    std::unique_lock<std::mutex> lock(d_poolMutex);
-    const bool got = d_poolCv.wait_for(lock, std::chrono::seconds(5),
-                                       [this]{ return !d_available.empty(); });
-    if (!got) {
-        throw std::runtime_error("DB connection pool exhausted (timeout)");
-    }
-    PGconn* conn = d_available.front();
-    d_available.pop();
-
-    // Reconnect if the connection has been lost.
-    if (PQstatus(conn) != CONNECTION_OK) {
-        PQreset(conn);
-        if (PQstatus(conn) != CONNECTION_OK) {
-            d_available.push(conn);   // put it back so the pool size stays correct
-            throw std::runtime_error("DB connection reset failed");
-        }
-    }
-    return ConnGuard{this, conn};
-}
-
-void DBManager::release(PGconn* conn) noexcept {
-    {
-        std::lock_guard<std::mutex> lock(d_poolMutex);
-        d_available.push(conn);
-    }
-    d_poolCv.notify_one();
-}
+    : d_pool_(connStr, static_cast<std::size_t>(poolSize))
+{}
 
 // ── SQLSTATE mapping ──────────────────────────────────────────────────────────
 
@@ -148,7 +90,7 @@ DbResult<RegisteredUser> DBManager::registerUser(
     std::string_view bio,
     const std::vector<std::string>& interests)
 {
-    ConnGuard cg = acquire();
+    auto cg = d_pool_.acquire();
 
     const std::string age_s          = std::to_string(age);
     const std::string interests_arr  = buildPgArray(interests);
@@ -164,7 +106,7 @@ DbResult<RegisteredUser> DBManager::registerUser(
         gender_s.c_str(), age_s.c_str(), bio_s.c_str(), interests_arr.c_str()
     };
 
-    PGResultGuard pgres(PQexecParams(cg.conn,
+    PGResultGuard pgres(PQexecParams(cg.get(),
         "INSERT INTO users (alias, real_name, email, password_hash, gender, age, bio, interests) "
         "VALUES ($1, $2, $3, crypt($4, gen_salt('bf')), $5::gender_type, $6::smallint, "
         "NULLIF($7,''), $8::text[]) "
@@ -173,7 +115,7 @@ DbResult<RegisteredUser> DBManager::registerUser(
 
     if (PQresultStatus(pgres.get()) != PGRES_TUPLES_OK) {
         const char* sqlstate = PQresultErrorField(pgres.get(), PG_DIAG_SQLSTATE);
-        return DbError{mapSqlState(sqlstate), PQerrorMessage(cg.conn)};
+        return DbError{mapSqlState(sqlstate), PQerrorMessage(cg.get())};
     }
 
     return RegisteredUser{
@@ -186,13 +128,13 @@ DbResult<LoginResult> DBManager::loginUser(
     std::string_view email,
     std::string_view password)
 {
-    ConnGuard cg = acquire();
+    auto cg = d_pool_.acquire();
 
     const std::string email_s(email);
     const std::string password_s(password);
     const char* params[] = { email_s.c_str(), password_s.c_str() };
 
-    PGResultGuard pgres(PQexecParams(cg.conn,
+    PGResultGuard pgres(PQexecParams(cg.get(),
         "SELECT id, alias, role FROM users "
         "WHERE email = $1 "
         "  AND password_hash = crypt($2, password_hash) "
@@ -213,7 +155,7 @@ DbResult<LoginResult> DBManager::loginUser(
 DbResult<UserListResult> DBManager::listUsers(
     int page, int limit, std::string_view genderFilter)
 {
-    ConnGuard cg = acquire();
+    auto cg = d_pool_.acquire();
 
     const int offset        = (page - 1) * limit;
     const std::string lim_s = std::to_string(limit);
@@ -224,14 +166,14 @@ DbResult<UserListResult> DBManager::listUsers(
 
     if (!gender_s.empty() && (gender_s == "male" || gender_s == "female")) {
         const char* params[] = { gender_s.c_str(), lim_s.c_str(), off_s.c_str() };
-        pgres = PGResultGuard(PQexecParams(cg.conn,
+        pgres = PGResultGuard(PQexecParams(cg.get(),
             "SELECT id, alias, gender, registered_at, has_completed_questionnaire "
             "FROM users WHERE deleted_at IS NULL AND gender = $1::gender_type "
             "ORDER BY registered_at DESC LIMIT $2::int OFFSET $3::int",
             3, nullptr, params, nullptr, nullptr, 0));
     } else {
         const char* params[] = { lim_s.c_str(), off_s.c_str() };
-        pgres = PGResultGuard(PQexecParams(cg.conn,
+        pgres = PGResultGuard(PQexecParams(cg.get(),
             "SELECT id, alias, gender, registered_at, has_completed_questionnaire "
             "FROM users WHERE deleted_at IS NULL "
             "ORDER BY registered_at DESC LIMIT $1::int OFFSET $2::int",
@@ -239,7 +181,7 @@ DbResult<UserListResult> DBManager::listUsers(
     }
 
     if (PQresultStatus(pgres.get()) != PGRES_TUPLES_OK) {
-        return DbError{DbErrc::InternalError, PQerrorMessage(cg.conn)};
+        return DbError{DbErrc::InternalError, PQerrorMessage(cg.get())};
     }
 
     UserListResult result;
@@ -260,12 +202,12 @@ DbResult<UserListResult> DBManager::listUsers(
 }
 
 DbResult<UserProfile> DBManager::getUser(int64_t userId) {
-    ConnGuard cg = acquire();
+    auto cg = d_pool_.acquire();
 
     const std::string id_s = std::to_string(userId);
     const char* params[] = { id_s.c_str() };
 
-    PGResultGuard pgres(PQexecParams(cg.conn,
+    PGResultGuard pgres(PQexecParams(cg.get(),
         "SELECT id, alias, gender, age, bio, interests, has_completed_questionnaire "
         "FROM users WHERE id = $1::bigint AND deleted_at IS NULL",
         1, nullptr, params, nullptr, nullptr, 0));
@@ -288,7 +230,7 @@ DbResult<UserProfile> DBManager::getUser(int64_t userId) {
 }
 
 DbResult<std::monostate> DBManager::updateUser(int64_t userId, const UpdateFields& fields) {
-    ConnGuard cg = acquire();
+    auto cg = d_pool_.acquire();
 
     std::vector<std::string> clauses;
     std::vector<std::string> values;
@@ -323,7 +265,7 @@ DbResult<std::monostate> DBManager::updateUser(int64_t userId, const UpdateField
     params.reserve(values.size());
     for (const auto& v : values) params.push_back(v.c_str());
 
-    PGResultGuard pgres(PQexecParams(cg.conn, sql.c_str(),
+    PGResultGuard pgres(PQexecParams(cg.get(), sql.c_str(),
         static_cast<int>(params.size()), nullptr, params.data(), nullptr, nullptr, 0));
 
     if (PQresultStatus(pgres.get()) != PGRES_TUPLES_OK || PQntuples(pgres.get()) == 0)
@@ -333,31 +275,31 @@ DbResult<std::monostate> DBManager::updateUser(int64_t userId, const UpdateField
 }
 
 DbResult<std::monostate> DBManager::deleteUser(int64_t userId) {
-    ConnGuard cg = acquire();
+    auto cg = d_pool_.acquire();
 
     const std::string id_s = std::to_string(userId);
     const char* params[] = { id_s.c_str() };
 
     // Step 1: nullify PII to satisfy GDPR right-to-erasure.
-    PGResultGuard pgres1(PQexecParams(cg.conn,
+    PGResultGuard pgres1(PQexecParams(cg.get(),
         "UPDATE users SET real_name = NULL, email = NULL, password_hash = NULL, "
         "bio = NULL, interests = '{}' "
         "WHERE id = $1::bigint AND deleted_at IS NULL",
         1, nullptr, params, nullptr, nullptr, 0));
 
     if (PQresultStatus(pgres1.get()) != PGRES_COMMAND_OK)
-        return DbError{DbErrc::InternalError, PQerrorMessage(cg.conn)};
+        return DbError{DbErrc::InternalError, PQerrorMessage(cg.get())};
 
     if (std::string(PQcmdTuples(pgres1.get())) == "0")
         return DbError{DbErrc::NotFound, "user not found"};
 
     // Step 2: soft-delete.
-    PGResultGuard pgres2(PQexecParams(cg.conn,
+    PGResultGuard pgres2(PQexecParams(cg.get(),
         "UPDATE users SET deleted_at = NOW() WHERE id = $1::bigint",
         1, nullptr, params, nullptr, nullptr, 0));
 
     if (PQresultStatus(pgres2.get()) != PGRES_COMMAND_OK)
-        return DbError{DbErrc::InternalError, PQerrorMessage(cg.conn)};
+        return DbError{DbErrc::InternalError, PQerrorMessage(cg.get())};
 
     return std::monostate{};
 }
@@ -369,7 +311,7 @@ DbResult<QuestionnaireSubmission> DBManager::submitQuestionnaire(
     int questionVersion,
     const std::vector<QuestionnaireAnswer>& answers)
 {
-    ConnGuard cg = acquire();
+    auto cg = d_pool_.acquire();
 
     // Build JSONB answer array: [{"questionId":1,"answer":"yes"}, ...]
     std::ostringstream json;
@@ -386,43 +328,43 @@ DbResult<QuestionnaireSubmission> DBManager::submitQuestionnaire(
     const std::string version_s = std::to_string(questionVersion);
 
     // Run in a transaction so all three steps are atomic.
-    PGResultGuard beginRes(PQexec(cg.conn, "BEGIN"));
+    PGResultGuard beginRes(PQexec(cg.get(), "BEGIN"));
     if (PQresultStatus(beginRes.get()) != PGRES_COMMAND_OK) {
-        return DbError{DbErrc::InternalError, PQerrorMessage(cg.conn)};
+        return DbError{DbErrc::InternalError, PQerrorMessage(cg.get())};
     }
 
     const char* p1[] = { userId_s.c_str() };
-    PGResultGuard markOld(PQexecParams(cg.conn,
+    PGResultGuard markOld(PQexecParams(cg.get(),
         "UPDATE questionnaire_submissions SET is_current = false "
         "WHERE user_id = $1::bigint AND is_current = true",
         1, nullptr, p1, nullptr, nullptr, 0));
     if (PQresultStatus(markOld.get()) != PGRES_COMMAND_OK) {
-        PQexec(cg.conn, "ROLLBACK");
-        return DbError{DbErrc::InternalError, PQerrorMessage(cg.conn)};
+        PQexec(cg.get(), "ROLLBACK");
+        return DbError{DbErrc::InternalError, PQerrorMessage(cg.get())};
     }
 
     const char* p2[] = { userId_s.c_str(), version_s.c_str(), answersJson.c_str() };
-    PGResultGuard insertRes(PQexecParams(cg.conn,
+    PGResultGuard insertRes(PQexecParams(cg.get(),
         "INSERT INTO questionnaire_submissions (user_id, question_version, answers, is_current) "
         "VALUES ($1::bigint, $2::int, $3::jsonb, true) "
         "RETURNING id, user_id, submitted_at",
         3, nullptr, p2, nullptr, nullptr, 0));
     if (PQresultStatus(insertRes.get()) != PGRES_TUPLES_OK) {
-        PQexec(cg.conn, "ROLLBACK");
-        return DbError{DbErrc::InternalError, PQerrorMessage(cg.conn)};
+        PQexec(cg.get(), "ROLLBACK");
+        return DbError{DbErrc::InternalError, PQerrorMessage(cg.get())};
     }
 
-    PGResultGuard markDone(PQexecParams(cg.conn,
+    PGResultGuard markDone(PQexecParams(cg.get(),
         "UPDATE users SET has_completed_questionnaire = true WHERE id = $1::bigint",
         1, nullptr, p1, nullptr, nullptr, 0));
     if (PQresultStatus(markDone.get()) != PGRES_COMMAND_OK) {
-        PQexec(cg.conn, "ROLLBACK");
-        return DbError{DbErrc::InternalError, PQerrorMessage(cg.conn)};
+        PQexec(cg.get(), "ROLLBACK");
+        return DbError{DbErrc::InternalError, PQerrorMessage(cg.get())};
     }
 
-    PGResultGuard commitRes(PQexec(cg.conn, "COMMIT"));
+    PGResultGuard commitRes(PQexec(cg.get(), "COMMIT"));
     if (PQresultStatus(commitRes.get()) != PGRES_COMMAND_OK) {
-        return DbError{DbErrc::InternalError, PQerrorMessage(cg.conn)};
+        return DbError{DbErrc::InternalError, PQerrorMessage(cg.get())};
     }
 
     return QuestionnaireSubmission{
@@ -435,15 +377,15 @@ DbResult<QuestionnaireSubmission> DBManager::submitQuestionnaire(
 // ── Compatibility ─────────────────────────────────────────────────────────────
 
 DbResult<std::vector<CompatibilityScore>> DBManager::getCompatibilityMatrix() {
-    ConnGuard cg = acquire();
+    auto cg = d_pool_.acquire();
 
-    PGResultGuard pgres(PQexecParams(cg.conn,
+    PGResultGuard pgres(PQexecParams(cg.get(),
         "SELECT man_id, woman_id, score FROM compatibility_scores "
         "ORDER BY man_id, woman_id",
         0, nullptr, nullptr, nullptr, nullptr, 0));
 
     if (PQresultStatus(pgres.get()) != PGRES_TUPLES_OK)
-        return DbError{DbErrc::InternalError, PQerrorMessage(cg.conn)};
+        return DbError{DbErrc::InternalError, PQerrorMessage(cg.get())};
 
     std::vector<CompatibilityScore> result;
     const int rows = PQntuples(pgres.get());
@@ -460,19 +402,19 @@ DbResult<std::vector<CompatibilityScore>> DBManager::getCompatibilityMatrix() {
 
 DbResult<std::vector<CompatibilityScore>>
 DBManager::getCompatibilityMatrixAboveThreshold(int threshold) {
-    ConnGuard cg = acquire();
+    auto cg = d_pool_.acquire();
 
     const std::string thr_s = std::to_string(threshold);
     const char* params[] = { thr_s.c_str() };
 
-    PGResultGuard pgres(PQexecParams(cg.conn,
+    PGResultGuard pgres(PQexecParams(cg.get(),
         "SELECT man_id, woman_id, score FROM compatibility_scores "
         "WHERE score >= $1::int "
         "ORDER BY man_id, woman_id",
         1, nullptr, params, nullptr, nullptr, 0));
 
     if (PQresultStatus(pgres.get()) != PGRES_TUPLES_OK)
-        return DbError{DbErrc::InternalError, PQerrorMessage(cg.conn)};
+        return DbError{DbErrc::InternalError, PQerrorMessage(cg.get())};
 
     std::vector<CompatibilityScore> result;
     const int rows = PQntuples(pgres.get());
@@ -490,13 +432,13 @@ DBManager::getCompatibilityMatrixAboveThreshold(int threshold) {
 // ── Events ────────────────────────────────────────────────────────────────────
 
 DbResult<std::vector<Event>> DBManager::listEvents(std::string_view statusFilter) {
-    ConnGuard cg = acquire();
+    auto cg = d_pool_.acquire();
 
     const std::string sf(statusFilter);
     PGResultGuard pgres{nullptr};
 
     if (sf == "all") {
-        pgres = PGResultGuard(PQexecParams(cg.conn,
+        pgres = PGResultGuard(PQexecParams(cg.get(),
             "SELECT e.id, e.name, e.description, e.event_date, e.max_participants, "
             "       COUNT(ep.id) AS registered_count, e.status, e.default_algorithm "
             "FROM events e "
@@ -504,7 +446,7 @@ DbResult<std::vector<Event>> DBManager::listEvents(std::string_view statusFilter
             "GROUP BY e.id ORDER BY e.event_date DESC",
             0, nullptr, nullptr, nullptr, nullptr, 0));
     } else if (sf == "past") {
-        pgres = PGResultGuard(PQexecParams(cg.conn,
+        pgres = PGResultGuard(PQexecParams(cg.get(),
             "SELECT e.id, e.name, e.description, e.event_date, e.max_participants, "
             "       COUNT(ep.id) AS registered_count, e.status, e.default_algorithm "
             "FROM events e "
@@ -514,7 +456,7 @@ DbResult<std::vector<Event>> DBManager::listEvents(std::string_view statusFilter
             0, nullptr, nullptr, nullptr, nullptr, 0));
     } else {
         // default: upcoming
-        pgres = PGResultGuard(PQexecParams(cg.conn,
+        pgres = PGResultGuard(PQexecParams(cg.get(),
             "SELECT e.id, e.name, e.description, e.event_date, e.max_participants, "
             "       COUNT(ep.id) AS registered_count, e.status, e.default_algorithm "
             "FROM events e "
@@ -525,7 +467,7 @@ DbResult<std::vector<Event>> DBManager::listEvents(std::string_view statusFilter
     }
 
     if (PQresultStatus(pgres.get()) != PGRES_TUPLES_OK)
-        return DbError{DbErrc::InternalError, PQerrorMessage(cg.conn)};
+        return DbError{DbErrc::InternalError, PQerrorMessage(cg.get())};
 
     std::vector<Event> result;
     const int rows = PQntuples(pgres.get());
@@ -547,7 +489,7 @@ DbResult<std::vector<Event>> DBManager::listEvents(std::string_view statusFilter
 }
 
 DbResult<Event> DBManager::createEvent(const CreateEventInput& input) {
-    ConnGuard cg = acquire();
+    auto cg = d_pool_.acquire();
 
     const std::string max_s  = std::to_string(input.maxParticipants);
     const std::string by_s   = std::to_string(input.createdBy);
@@ -565,7 +507,7 @@ DbResult<Event> DBManager::createEvent(const CreateEventInput& input) {
         by_s.c_str()
     };
 
-    PGResultGuard pgres(PQexecParams(cg.conn,
+    PGResultGuard pgres(PQexecParams(cg.get(),
         "INSERT INTO events "
         "(name, description, event_date, max_participants, default_algorithm, "
         " threshold_override, created_by) "
@@ -577,7 +519,7 @@ DbResult<Event> DBManager::createEvent(const CreateEventInput& input) {
 
     if (PQresultStatus(pgres.get()) != PGRES_TUPLES_OK) {
         const char* sqlstate = PQresultErrorField(pgres.get(), PG_DIAG_SQLSTATE);
-        return DbError{mapSqlState(sqlstate), PQerrorMessage(cg.conn)};
+        return DbError{mapSqlState(sqlstate), PQerrorMessage(cg.get())};
     }
 
     Event ev;
@@ -594,12 +536,12 @@ DbResult<Event> DBManager::createEvent(const CreateEventInput& input) {
 }
 
 DbResult<Event> DBManager::getEvent(int64_t eventId) {
-    ConnGuard cg = acquire();
+    auto cg = d_pool_.acquire();
 
     const std::string id_s = std::to_string(eventId);
     const char* params[] = { id_s.c_str() };
 
-    PGResultGuard pgres(PQexecParams(cg.conn,
+    PGResultGuard pgres(PQexecParams(cg.get(),
         "SELECT e.id, e.name, e.description, e.event_date, e.max_participants, "
         "       COUNT(ep.id) AS registered_count, e.status, e.default_algorithm "
         "FROM events e "
@@ -625,12 +567,12 @@ DbResult<Event> DBManager::getEvent(int64_t eventId) {
 }
 
 DbResult<std::vector<EventParticipant>> DBManager::getEventParticipants(int64_t eventId) {
-    ConnGuard cg = acquire();
+    auto cg = d_pool_.acquire();
 
     const std::string id_s = std::to_string(eventId);
     const char* params[] = { id_s.c_str() };
 
-    PGResultGuard pgres(PQexecParams(cg.conn,
+    PGResultGuard pgres(PQexecParams(cg.get(),
         "SELECT ep.user_id, u.alias, ep.registered_at "
         "FROM event_participants ep "
         "JOIN users u ON u.id = ep.user_id "
@@ -639,7 +581,7 @@ DbResult<std::vector<EventParticipant>> DBManager::getEventParticipants(int64_t 
         1, nullptr, params, nullptr, nullptr, 0));
 
     if (PQresultStatus(pgres.get()) != PGRES_TUPLES_OK)
-        return DbError{DbErrc::InternalError, PQerrorMessage(cg.conn)};
+        return DbError{DbErrc::InternalError, PQerrorMessage(cg.get())};
 
     std::vector<EventParticipant> result;
     const int rows = PQntuples(pgres.get());
@@ -655,25 +597,25 @@ DbResult<std::vector<EventParticipant>> DBManager::getEventParticipants(int64_t 
 }
 
 DbResult<EventRegistration> DBManager::registerForEvent(int64_t eventId, int64_t userId) {
-    ConnGuard cg = acquire();
+    auto cg = d_pool_.acquire();
 
     const std::string eid_s = std::to_string(eventId);
     const std::string uid_s = std::to_string(userId);
 
-    PGResultGuard beginRes(PQexec(cg.conn, "BEGIN"));
+    PGResultGuard beginRes(PQexec(cg.get(), "BEGIN"));
     if (PQresultStatus(beginRes.get()) != PGRES_COMMAND_OK)
-        return DbError{DbErrc::InternalError, PQerrorMessage(cg.conn)};
+        return DbError{DbErrc::InternalError, PQerrorMessage(cg.get())};
 
     // Lock the event row and read capacity.
     const char* ep1[] = { eid_s.c_str() };
-    PGResultGuard evRes(PQexecParams(cg.conn,
+    PGResultGuard evRes(PQexecParams(cg.get(),
         "SELECT max_participants, status, "
         "       (SELECT COUNT(*) FROM event_participants WHERE event_id = $1::bigint) "
         "FROM events WHERE id = $1::bigint FOR UPDATE",
         1, nullptr, ep1, nullptr, nullptr, 0));
 
     if (PQresultStatus(evRes.get()) != PGRES_TUPLES_OK || PQntuples(evRes.get()) == 0) {
-        PQexec(cg.conn, "ROLLBACK");
+        PQexec(cg.get(), "ROLLBACK");
         return DbError{DbErrc::NotFound, "event not found"};
     }
 
@@ -682,32 +624,32 @@ DbResult<EventRegistration> DBManager::registerForEvent(int64_t eventId, int64_t
     const int regCount  = std::stoi(PQgetvalue(evRes.get(), 0, 2));
 
     if (evStatus != "upcoming" && evStatus != "active") {
-        PQexec(cg.conn, "ROLLBACK");
+        PQexec(cg.get(), "ROLLBACK");
         return DbError{DbErrc::InvalidInput, "event is not open for registration"};
     }
     if (regCount >= maxPart) {
-        PQexec(cg.conn, "ROLLBACK");
+        PQexec(cg.get(), "ROLLBACK");
         return DbError{DbErrc::InvalidInput, "event is full"};
     }
 
     // Check questionnaire completion.
     const char* ep2[] = { uid_s.c_str() };
-    PGResultGuard userRes(PQexecParams(cg.conn,
+    PGResultGuard userRes(PQexecParams(cg.get(),
         "SELECT has_completed_questionnaire FROM users "
         "WHERE id = $1::bigint AND deleted_at IS NULL",
         1, nullptr, ep2, nullptr, nullptr, 0));
 
     if (PQresultStatus(userRes.get()) != PGRES_TUPLES_OK || PQntuples(userRes.get()) == 0) {
-        PQexec(cg.conn, "ROLLBACK");
+        PQexec(cg.get(), "ROLLBACK");
         return DbError{DbErrc::NotFound, "user not found"};
     }
     if (!pgGetBool(userRes.get(), 0, 0)) {
-        PQexec(cg.conn, "ROLLBACK");
+        PQexec(cg.get(), "ROLLBACK");
         return DbError{DbErrc::InvalidInput, "questionnaire not completed"};
     }
 
     const char* ep3[] = { eid_s.c_str(), uid_s.c_str() };
-    PGResultGuard insRes(PQexecParams(cg.conn,
+    PGResultGuard insRes(PQexecParams(cg.get(),
         "INSERT INTO event_participants (event_id, user_id) "
         "VALUES ($1::bigint, $2::bigint) "
         "RETURNING event_id, user_id, registered_at",
@@ -715,13 +657,13 @@ DbResult<EventRegistration> DBManager::registerForEvent(int64_t eventId, int64_t
 
     if (PQresultStatus(insRes.get()) != PGRES_TUPLES_OK) {
         const char* sqlstate = PQresultErrorField(insRes.get(), PG_DIAG_SQLSTATE);
-        PQexec(cg.conn, "ROLLBACK");
-        return DbError{mapSqlState(sqlstate), PQerrorMessage(cg.conn)};
+        PQexec(cg.get(), "ROLLBACK");
+        return DbError{mapSqlState(sqlstate), PQerrorMessage(cg.get())};
     }
 
-    PGResultGuard commitRes(PQexec(cg.conn, "COMMIT"));
+    PGResultGuard commitRes(PQexec(cg.get(), "COMMIT"));
     if (PQresultStatus(commitRes.get()) != PGRES_COMMAND_OK)
-        return DbError{DbErrc::InternalError, PQerrorMessage(cg.conn)};
+        return DbError{DbErrc::InternalError, PQerrorMessage(cg.get())};
 
     return EventRegistration{
         std::stoll(PQgetvalue(insRes.get(), 0, 0)),
@@ -733,12 +675,12 @@ DbResult<EventRegistration> DBManager::registerForEvent(int64_t eventId, int64_t
 // ── Algorithm runs ────────────────────────────────────────────────────────────
 
 DbResult<std::vector<AlgorithmRunRecord>> DBManager::getEventAlgorithmRuns(int64_t eventId) {
-    ConnGuard cg = acquire();
+    auto cg = d_pool_.acquire();
 
     const std::string id_s = std::to_string(eventId);
     const char* params[] = { id_s.c_str() };
 
-    PGResultGuard pgres(PQexecParams(cg.conn,
+    PGResultGuard pgres(PQexecParams(cg.get(),
         "SELECT id, event_id, algorithm, results::text, total_score, "
         "       matched_count, avg_score, ran_at "
         "FROM algorithm_runs "
@@ -747,7 +689,7 @@ DbResult<std::vector<AlgorithmRunRecord>> DBManager::getEventAlgorithmRuns(int64
         1, nullptr, params, nullptr, nullptr, 0));
 
     if (PQresultStatus(pgres.get()) != PGRES_TUPLES_OK)
-        return DbError{DbErrc::InternalError, PQerrorMessage(cg.conn)};
+        return DbError{DbErrc::InternalError, PQerrorMessage(cg.get())};
 
     std::vector<AlgorithmRunRecord> result;
     const int rows = PQntuples(pgres.get());
@@ -768,7 +710,7 @@ DbResult<std::vector<AlgorithmRunRecord>> DBManager::getEventAlgorithmRuns(int64
 }
 
 DbResult<AlgorithmRunRecord> DBManager::persistAlgorithmRun(const PersistRunInput& input) {
-    ConnGuard cg = acquire();
+    auto cg = d_pool_.acquire();
 
     const std::string eid_s   = std::to_string(input.eventId);
     const std::string tot_s   = std::to_string(input.totalScore);
@@ -777,26 +719,26 @@ DbResult<AlgorithmRunRecord> DBManager::persistAlgorithmRun(const PersistRunInpu
     const std::string thr_s   = input.threshold ? std::to_string(*input.threshold) : "";
     const char* thr_ptr       = input.threshold ? thr_s.c_str() : nullptr;
 
-    PGResultGuard beginRes(PQexec(cg.conn, "BEGIN"));
+    PGResultGuard beginRes(PQexec(cg.get(), "BEGIN"));
     if (PQresultStatus(beginRes.get()) != PGRES_COMMAND_OK)
-        return DbError{DbErrc::InternalError, PQerrorMessage(cg.conn)};
+        return DbError{DbErrc::InternalError, PQerrorMessage(cg.get())};
 
     // Mark previous runs for the same (event, algorithm) as not current.
     const char* p1[] = { eid_s.c_str(), input.algorithm.c_str() };
-    PGResultGuard markOld(PQexecParams(cg.conn,
+    PGResultGuard markOld(PQexecParams(cg.get(),
         "UPDATE algorithm_runs SET is_current = false "
         "WHERE event_id = $1::bigint AND algorithm = $2::algorithm_type AND is_current = true",
         2, nullptr, p1, nullptr, nullptr, 0));
     if (PQresultStatus(markOld.get()) != PGRES_COMMAND_OK) {
-        PQexec(cg.conn, "ROLLBACK");
-        return DbError{DbErrc::InternalError, PQerrorMessage(cg.conn)};
+        PQexec(cg.get(), "ROLLBACK");
+        return DbError{DbErrc::InternalError, PQerrorMessage(cg.get())};
     }
 
     const char* p2[] = {
         eid_s.c_str(), input.algorithm.c_str(), thr_ptr,
         input.resultsJson.c_str(), tot_s.c_str(), cnt_s.c_str(), avg_s.c_str()
     };
-    PGResultGuard insRes(PQexecParams(cg.conn,
+    PGResultGuard insRes(PQexecParams(cg.get(),
         "INSERT INTO algorithm_runs "
         "(event_id, algorithm, threshold, results, total_score, matched_count, avg_score, is_current) "
         "VALUES ($1::bigint, $2::algorithm_type, $3::smallint, $4::jsonb, "
@@ -806,13 +748,13 @@ DbResult<AlgorithmRunRecord> DBManager::persistAlgorithmRun(const PersistRunInpu
         7, nullptr, p2, nullptr, nullptr, 0));
 
     if (PQresultStatus(insRes.get()) != PGRES_TUPLES_OK) {
-        PQexec(cg.conn, "ROLLBACK");
-        return DbError{DbErrc::InternalError, PQerrorMessage(cg.conn)};
+        PQexec(cg.get(), "ROLLBACK");
+        return DbError{DbErrc::InternalError, PQerrorMessage(cg.get())};
     }
 
-    PGResultGuard commitRes(PQexec(cg.conn, "COMMIT"));
+    PGResultGuard commitRes(PQexec(cg.get(), "COMMIT"));
     if (PQresultStatus(commitRes.get()) != PGRES_COMMAND_OK)
-        return DbError{DbErrc::InternalError, PQerrorMessage(cg.conn)};
+        return DbError{DbErrc::InternalError, PQerrorMessage(cg.get())};
 
     return AlgorithmRunRecord{
         std::stoll(PQgetvalue(insRes.get(), 0, 0)),
@@ -858,7 +800,7 @@ static const char* kMatchSelectJoin =
     "JOIN users uw ON uw.id = m.woman_id ";
 
 DbResult<std::vector<Match>> DBManager::listMatchesForUser(int64_t userId) {
-    ConnGuard cg = acquire();
+    auto cg = d_pool_.acquire();
 
     const std::string id_s = std::to_string(userId);
     const char* params[] = { id_s.c_str() };
@@ -867,11 +809,11 @@ DbResult<std::vector<Match>> DBManager::listMatchesForUser(int64_t userId) {
         "WHERE m.man_id = $1::bigint OR m.woman_id = $1::bigint "
         "ORDER BY m.created_at DESC";
 
-    PGResultGuard pgres(PQexecParams(cg.conn, sql.c_str(),
+    PGResultGuard pgres(PQexecParams(cg.get(), sql.c_str(),
         1, nullptr, params, nullptr, nullptr, 0));
 
     if (PQresultStatus(pgres.get()) != PGRES_TUPLES_OK)
-        return DbError{DbErrc::InternalError, PQerrorMessage(cg.conn)};
+        return DbError{DbErrc::InternalError, PQerrorMessage(cg.get())};
 
     std::vector<Match> result;
     const int rows = PQntuples(pgres.get());
@@ -882,7 +824,7 @@ DbResult<std::vector<Match>> DBManager::listMatchesForUser(int64_t userId) {
 }
 
 DbResult<Match> DBManager::getMatch(int64_t matchId) {
-    ConnGuard cg = acquire();
+    auto cg = d_pool_.acquire();
 
     const std::string id_s = std::to_string(matchId);
     const char* params[] = { id_s.c_str() };
@@ -890,7 +832,7 @@ DbResult<Match> DBManager::getMatch(int64_t matchId) {
     const std::string sql = std::string(kMatchSelectJoin) +
         "WHERE m.id = $1::bigint";
 
-    PGResultGuard pgres(PQexecParams(cg.conn, sql.c_str(),
+    PGResultGuard pgres(PQexecParams(cg.get(), sql.c_str(),
         1, nullptr, params, nullptr, nullptr, 0));
 
     if (PQresultStatus(pgres.get()) != PGRES_TUPLES_OK || PQntuples(pgres.get()) == 0)
@@ -900,7 +842,7 @@ DbResult<Match> DBManager::getMatch(int64_t matchId) {
 }
 
 DbResult<Match> DBManager::acceptMatch(int64_t matchId, int64_t userId) {
-    ConnGuard cg = acquire();
+    auto cg = d_pool_.acquire();
 
     const std::string mid_s = std::to_string(matchId);
     const std::string uid_s = std::to_string(userId);
@@ -911,7 +853,7 @@ DbResult<Match> DBManager::acceptMatch(int64_t matchId, int64_t userId) {
     const std::string updateSql = std::string(kMatchSelectJoin) +
         "WHERE m.id = $1::bigint";
 
-    PGResultGuard upd(PQexecParams(cg.conn,
+    PGResultGuard upd(PQexecParams(cg.get(),
         "UPDATE matches SET "
         "  accepted_by_man   = CASE WHEN man_id   = $2::bigint THEN true ELSE accepted_by_man   END, "
         "  accepted_by_woman = CASE WHEN woman_id = $2::bigint THEN true ELSE accepted_by_woman END "
@@ -927,13 +869,13 @@ DbResult<Match> DBManager::acceptMatch(int64_t matchId, int64_t userId) {
 }
 
 DbResult<std::monostate> DBManager::declineMatch(int64_t matchId, int64_t userId) {
-    ConnGuard cg = acquire();
+    auto cg = d_pool_.acquire();
 
     const std::string mid_s = std::to_string(matchId);
     const std::string uid_s = std::to_string(userId);
     const char* params[] = { mid_s.c_str(), uid_s.c_str() };
 
-    PGResultGuard pgres(PQexecParams(cg.conn,
+    PGResultGuard pgres(PQexecParams(cg.get(),
         "UPDATE matches SET status = 'declined', declined_by = $2::bigint "
         "WHERE id = $1::bigint "
         "RETURNING id",
@@ -952,7 +894,7 @@ DbResult<MessagePage> DBManager::getMessages(
     int limit,
     std::optional<int64_t> beforeId)
 {
-    ConnGuard cg = acquire();
+    auto cg = d_pool_.acquire();
 
     const std::string mid_s   = std::to_string(matchId);
     // Fetch limit+1 to detect hasMore.
@@ -963,7 +905,7 @@ DbResult<MessagePage> DBManager::getMessages(
     if (beforeId) {
         const std::string bid_s = std::to_string(*beforeId);
         const char* params[] = { mid_s.c_str(), bid_s.c_str(), lim_s.c_str() };
-        pgres = PGResultGuard(PQexecParams(cg.conn,
+        pgres = PGResultGuard(PQexecParams(cg.get(),
             "SELECT id, match_id, sender_id, text, sent_at "
             "FROM messages "
             "WHERE match_id = $1::bigint AND id < $2::bigint "
@@ -971,7 +913,7 @@ DbResult<MessagePage> DBManager::getMessages(
             3, nullptr, params, nullptr, nullptr, 0));
     } else {
         const char* params[] = { mid_s.c_str(), lim_s.c_str() };
-        pgres = PGResultGuard(PQexecParams(cg.conn,
+        pgres = PGResultGuard(PQexecParams(cg.get(),
             "SELECT id, match_id, sender_id, text, sent_at "
             "FROM messages "
             "WHERE match_id = $1::bigint "
@@ -980,7 +922,7 @@ DbResult<MessagePage> DBManager::getMessages(
     }
 
     if (PQresultStatus(pgres.get()) != PGRES_TUPLES_OK)
-        return DbError{DbErrc::InternalError, PQerrorMessage(cg.conn)};
+        return DbError{DbErrc::InternalError, PQerrorMessage(cg.get())};
 
     const int rows = PQntuples(pgres.get());
     const bool hasMore = (rows > limit);
@@ -1006,14 +948,14 @@ DbResult<Message> DBManager::sendMessage(
     int64_t senderId,
     std::string_view text)
 {
-    ConnGuard cg = acquire();
+    auto cg = d_pool_.acquire();
 
     const std::string mid_s = std::to_string(matchId);
     const std::string sid_s = std::to_string(senderId);
     const std::string text_s(text);
     const char* params[] = { mid_s.c_str(), sid_s.c_str(), text_s.c_str() };
 
-    PGResultGuard pgres(PQexecParams(cg.conn,
+    PGResultGuard pgres(PQexecParams(cg.get(),
         "INSERT INTO messages (match_id, sender_id, text) "
         "VALUES ($1::bigint, $2::bigint, $3) "
         "RETURNING id, match_id, sender_id, text, sent_at",
@@ -1021,7 +963,7 @@ DbResult<Message> DBManager::sendMessage(
 
     if (PQresultStatus(pgres.get()) != PGRES_TUPLES_OK) {
         const char* sqlstate = PQresultErrorField(pgres.get(), PG_DIAG_SQLSTATE);
-        return DbError{mapSqlState(sqlstate), PQerrorMessage(cg.conn)};
+        return DbError{mapSqlState(sqlstate), PQerrorMessage(cg.get())};
     }
 
     return Message{
