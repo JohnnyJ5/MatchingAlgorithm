@@ -1,232 +1,141 @@
-// Unit tests for DBManager.
+// GTest suite for DBManager.
 //
-// All tests use an invalid connection string so every internal ConnPool
-// connection attempt fails immediately.  This exercises two guarantees:
+// All tests use an invalid connection string so every ConnPool connection
+// attempt fails immediately.  This exercises two guarantees:
 //
-//  1. The constructor must not throw — it logs a warning and continues with
-//     an empty pool (partial-degradation contract from the header comment).
-//
-//  2. Every public method that must touch the database acquires a connection
-//     first.  With an empty pool that acquisition throws std::runtime_error.
-//     The methods must *not* silently swallow the exception; they must let it
-//     propagate so the caller knows the operation failed.  A method that
-//     catches and discards the pool exception would return a bogus
-//     default-constructed value and hide the failure.
-//
-// These tests also verify that no method performs a hard crash or throws
-// anything other than std::runtime_error when the pool is exhausted.
+//  1. Constructor must not throw — partial-degradation contract.
+//  2. Every public method propagates std::runtime_error from pool exhaustion
+//     rather than swallowing it silently.
 
 #include "../db_manager.h"
 
-#include <iostream>
+#include <gtest/gtest.h>
 #include <stdexcept>
-#include <string>
-
-static int failures = 0;
-
-static void check(const char* name, bool cond) {
-    std::cout << (cond ? "[PASS] " : "[FAIL] ") << name << "\n";
-    if (!cond) ++failures;
-}
 
 static constexpr const char* kBadConnStr =
     "host=127.0.0.1 port=9 dbname=nonexistent connect_timeout=1";
 
-// Returns a DBManager backed by an empty pool (no live connections).
-// Uses poolSize=1 to keep connection-attempt time short (one failure only).
+// DBManager backed by an empty pool.  poolSize=1 keeps connection-attempt
+// time short (one failure per test).
 static DBManager makeDeadManager() {
     return DBManager(kBadConnStr, 1);
 }
 
-// Helper: calls fn(), returns true iff it throws std::runtime_error.
-// Lambdas that return [[nodiscard]] values should use `return expr` so
-// the (void) cast here suppresses the unused-result warning at the call site.
-template<typename Fn>
-static bool throwsRuntimeError(Fn fn) {
-    try {
-        (void)fn();
-        return false;
-    } catch (const std::runtime_error&) {
-        return true;
-    } catch (...) {
-        return false;
-    }
-}
-
 // ── Constructor ───────────────────────────────────────────────────────────────
 
-// The constructor must not throw even when every connection fails.
-// The header documents "partial degradation" — the server should start and
-// serve non-DB endpoints while logging the connection failure.
-static void test_constructor_does_not_throw_on_bad_connstr() {
-    bool ok = true;
-    try {
-        DBManager mgr(kBadConnStr, 2);
-    } catch (...) {
-        ok = false;
-    }
-    check("ctor: does not throw with bad connstr", ok);
+TEST(DBManagerTest, ConstructorDoesNotThrowOnBadConnstr) {
+    EXPECT_NO_THROW({ DBManager mgr(kBadConnStr, 2); });
 }
 
 // ── User management ───────────────────────────────────────────────────────────
 
-static void test_get_user_propagates_pool_exception() {
+TEST(DBManagerTest, GetUserPropagatesPoolException) {
     auto mgr = makeDeadManager();
-    check("getUser: throws runtime_error",
-          throwsRuntimeError([&]{ return mgr.getUser(1); }));
+    EXPECT_THROW({ (void)mgr.getUser(1); }, std::runtime_error);
 }
 
-static void test_login_user_propagates_pool_exception() {
+TEST(DBManagerTest, LoginUserPropagatesPoolException) {
     auto mgr = makeDeadManager();
-    check("loginUser: throws runtime_error",
-          throwsRuntimeError([&]{ return mgr.loginUser("a@b.com", "pass"); }));
+    EXPECT_THROW({ (void)mgr.loginUser("a@b.com", "pass"); }, std::runtime_error);
 }
 
-static void test_list_users_propagates_pool_exception() {
+TEST(DBManagerTest, ListUsersPropagatesPoolException) {
     auto mgr = makeDeadManager();
-    check("listUsers: throws runtime_error",
-          throwsRuntimeError([&]{ return mgr.listUsers(1, 10); }));
+    EXPECT_THROW({ (void)mgr.listUsers(1, 10); }, std::runtime_error);
 }
 
-static void test_list_users_with_filter_propagates_pool_exception() {
+TEST(DBManagerTest, ListUsersWithFilterPropagatesPoolException) {
     auto mgr = makeDeadManager();
-    check("listUsers(filtered): throws runtime_error",
-          throwsRuntimeError([&]{ return mgr.listUsers(1, 10, "female"); }));
+    EXPECT_THROW({ (void)mgr.listUsers(1, 10, "female"); }, std::runtime_error);
 }
 
-static void test_register_user_propagates_pool_exception() {
+TEST(DBManagerTest, RegisterUserPropagatesPoolException) {
     auto mgr = makeDeadManager();
-    check("registerUser: throws runtime_error",
-          throwsRuntimeError([&]{
-              return mgr.registerUser("alice", "Alice Smith", "a@b.com",
-                                     "secret", "female", 25, "bio", {});
-          }));
+    EXPECT_THROW(
+        {
+            (void)mgr.registerUser("alice", "Alice Smith", "a@b.com",
+                                   "secret", "female", 25, "bio", {});
+        },
+        std::runtime_error);
 }
 
-static void test_update_user_propagates_pool_exception() {
+TEST(DBManagerTest, UpdateUserPropagatesPoolException) {
     auto mgr = makeDeadManager();
     UpdateFields f;
     f.alias = "newname";
-    check("updateUser: throws runtime_error",
-          throwsRuntimeError([&]{ return mgr.updateUser(1, f); }));
+    EXPECT_THROW({ (void)mgr.updateUser(1, f); }, std::runtime_error);
 }
 
-static void test_delete_user_propagates_pool_exception() {
+TEST(DBManagerTest, DeleteUserPropagatesPoolException) {
     auto mgr = makeDeadManager();
-    check("deleteUser: throws runtime_error",
-          throwsRuntimeError([&]{ return mgr.deleteUser(1); }));
+    EXPECT_THROW({ (void)mgr.deleteUser(1); }, std::runtime_error);
 }
 
 // ── Questionnaire ─────────────────────────────────────────────────────────────
 
-static void test_submit_questionnaire_propagates_pool_exception() {
+TEST(DBManagerTest, SubmitQuestionnairePropagatesPoolException) {
     auto mgr = makeDeadManager();
-    check("submitQuestionnaire: throws runtime_error",
-          throwsRuntimeError([&]{
-              return mgr.submitQuestionnaire(1, 1, {{1, "yes"}, {2, "7"}});
-          }));
+    EXPECT_THROW(
+        { (void)mgr.submitQuestionnaire(1, 1, {{1, "yes"}, {2, "7"}}); },
+        std::runtime_error);
 }
 
 // ── Compatibility ─────────────────────────────────────────────────────────────
 
-static void test_get_compat_matrix_propagates_pool_exception() {
+TEST(DBManagerTest, GetCompatibilityMatrixPropagatesPoolException) {
     auto mgr = makeDeadManager();
-    check("getCompatibilityMatrix: throws runtime_error",
-          throwsRuntimeError([&]{ return mgr.getCompatibilityMatrix(); }));
+    EXPECT_THROW({ (void)mgr.getCompatibilityMatrix(); }, std::runtime_error);
 }
 
-static void test_get_compat_matrix_threshold_propagates_pool_exception() {
+TEST(DBManagerTest, GetCompatibilityMatrixThresholdPropagatesPoolException) {
     auto mgr = makeDeadManager();
-    check("getCompatibilityMatrixAboveThreshold: throws runtime_error",
-          throwsRuntimeError([&]{
-              return mgr.getCompatibilityMatrixAboveThreshold(70);
-          }));
+    EXPECT_THROW(
+        { (void)mgr.getCompatibilityMatrixAboveThreshold(70); },
+        std::runtime_error);
 }
 
 // ── Events ────────────────────────────────────────────────────────────────────
 
-static void test_list_events_propagates_pool_exception() {
+TEST(DBManagerTest, ListEventsPropagatesPoolException) {
     auto mgr = makeDeadManager();
-    check("listEvents: throws runtime_error",
-          throwsRuntimeError([&]{ return mgr.listEvents(); }));
+    EXPECT_THROW({ (void)mgr.listEvents(); }, std::runtime_error);
 }
 
-static void test_get_event_propagates_pool_exception() {
+TEST(DBManagerTest, GetEventPropagatesPoolException) {
     auto mgr = makeDeadManager();
-    check("getEvent: throws runtime_error",
-          throwsRuntimeError([&]{ return mgr.getEvent(1); }));
+    EXPECT_THROW({ (void)mgr.getEvent(1); }, std::runtime_error);
 }
 
-static void test_register_for_event_propagates_pool_exception() {
+TEST(DBManagerTest, RegisterForEventPropagatesPoolException) {
     auto mgr = makeDeadManager();
-    check("registerForEvent: throws runtime_error",
-          throwsRuntimeError([&]{ return mgr.registerForEvent(1, 42); }));
+    EXPECT_THROW({ (void)mgr.registerForEvent(1, 42); }, std::runtime_error);
 }
 
 // ── Matches ───────────────────────────────────────────────────────────────────
 
-static void test_list_matches_propagates_pool_exception() {
+TEST(DBManagerTest, ListMatchesPropagatesPoolException) {
     auto mgr = makeDeadManager();
-    check("listMatchesForUser: throws runtime_error",
-          throwsRuntimeError([&]{ return mgr.listMatchesForUser(1); }));
+    EXPECT_THROW({ (void)mgr.listMatchesForUser(1); }, std::runtime_error);
 }
 
-static void test_accept_match_propagates_pool_exception() {
+TEST(DBManagerTest, AcceptMatchPropagatesPoolException) {
     auto mgr = makeDeadManager();
-    check("acceptMatch: throws runtime_error",
-          throwsRuntimeError([&]{ return mgr.acceptMatch(1, 42); }));
+    EXPECT_THROW({ (void)mgr.acceptMatch(1, 42); }, std::runtime_error);
 }
 
-static void test_decline_match_propagates_pool_exception() {
+TEST(DBManagerTest, DeclineMatchPropagatesPoolException) {
     auto mgr = makeDeadManager();
-    check("declineMatch: throws runtime_error",
-          throwsRuntimeError([&]{ return mgr.declineMatch(1, 42); }));
+    EXPECT_THROW({ (void)mgr.declineMatch(1, 42); }, std::runtime_error);
 }
 
 // ── Messages ──────────────────────────────────────────────────────────────────
 
-static void test_get_messages_propagates_pool_exception() {
+TEST(DBManagerTest, GetMessagesPropagatesPoolException) {
     auto mgr = makeDeadManager();
-    check("getMessages: throws runtime_error",
-          throwsRuntimeError([&]{ return mgr.getMessages(1, 50); }));
+    EXPECT_THROW({ (void)mgr.getMessages(1, 50); }, std::runtime_error);
 }
 
-static void test_send_message_propagates_pool_exception() {
+TEST(DBManagerTest, SendMessagePropagatesPoolException) {
     auto mgr = makeDeadManager();
-    check("sendMessage: throws runtime_error",
-          throwsRuntimeError([&]{ return mgr.sendMessage(1, 42, "hello"); }));
-}
-
-int main() {
-    test_constructor_does_not_throw_on_bad_connstr();
-
-    test_get_user_propagates_pool_exception();
-    test_login_user_propagates_pool_exception();
-    test_list_users_propagates_pool_exception();
-    test_list_users_with_filter_propagates_pool_exception();
-    test_register_user_propagates_pool_exception();
-    test_update_user_propagates_pool_exception();
-    test_delete_user_propagates_pool_exception();
-
-    test_submit_questionnaire_propagates_pool_exception();
-
-    test_get_compat_matrix_propagates_pool_exception();
-    test_get_compat_matrix_threshold_propagates_pool_exception();
-
-    test_list_events_propagates_pool_exception();
-    test_get_event_propagates_pool_exception();
-    test_register_for_event_propagates_pool_exception();
-
-    test_list_matches_propagates_pool_exception();
-    test_accept_match_propagates_pool_exception();
-    test_decline_match_propagates_pool_exception();
-
-    test_get_messages_propagates_pool_exception();
-    test_send_message_propagates_pool_exception();
-
-    if (failures > 0)
-        std::cout << failures << " DBManager test(s) FAILED.\n";
-    else
-        std::cout << "All DBManager tests passed.\n";
-    return failures > 0 ? 1 : 0;
+    EXPECT_THROW({ (void)mgr.sendMessage(1, 42, "hello"); }, std::runtime_error);
 }
