@@ -12,7 +12,7 @@ all:
 	$(DC_RUN) sh -c '$(CMAKE_BUILD)'
 
 tests:
-	$(DC_RUN) sh -c '$(CMAKE_BUILD) --target test_gale_shapley test_hopcroft_karp test_hungarian test_blossom'
+	$(DC_RUN) sh -c '$(CMAKE_BUILD) --target test_gale_shapley test_hopcroft_karp test_hungarian test_blossom test_db_types test_conn_pool test_db_manager'
 
 # ── Run ───────────────────────────────────────────────────────────────────────
 run:
@@ -23,8 +23,8 @@ run_server:
 
 # ── Test ──────────────────────────────────────────────────────────────────────
 run_tests:
-	$(DC_RUN) sh -c '$(CMAKE_BUILD) --target test_gale_shapley test_hopcroft_karp test_hungarian test_blossom && \
-	    for t in $(BUILD)/test_gale_shapley $(BUILD)/test_hopcroft_karp $(BUILD)/test_hungarian $(BUILD)/test_blossom; do \
+	$(DC_RUN) sh -c '$(CMAKE_BUILD) --target test_gale_shapley test_hopcroft_karp test_hungarian test_blossom test_db_types test_conn_pool test_db_manager && \
+	    for t in $(BUILD)/test_gale_shapley $(BUILD)/test_hopcroft_karp $(BUILD)/test_hungarian $(BUILD)/test_blossom $(BUILD)/test_db_types $(BUILD)/test_conn_pool $(BUILD)/test_db_manager; do \
 	        echo "--- $$t ---"; ./$$t; echo; \
 	    done'
 
