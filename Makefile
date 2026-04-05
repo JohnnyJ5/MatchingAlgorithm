@@ -4,7 +4,7 @@ DC_RUN  := docker compose run --rm dev
 # cmake configure + build in one shot (skips configure if already done)
 CMAKE_BUILD = [ -f $(BUILD)/CMakeCache.txt ] || cmake -S . -B $(BUILD); cmake --build $(BUILD) --parallel
 
-.PHONY: all tests run_tests run run_server clean \
+.PHONY: all tests run_tests run run_server lint clean \
         docker-build docker-start docker-stop docker-logs
 
 # ── Build ─────────────────────────────────────────────────────────────────────
@@ -27,6 +27,12 @@ run_tests:
 	    for t in $(BUILD)/test_gale_shapley $(BUILD)/test_hopcroft_karp $(BUILD)/test_hungarian $(BUILD)/test_blossom $(BUILD)/test_db_types $(BUILD)/test_conn_pool $(BUILD)/test_db_manager; do \
 	        echo "--- $$t ---"; ./$$t; echo; \
 	    done'
+
+# ── Lint ──────────────────────────────────────────────────────────────────────
+lint:
+	$(DC_RUN) sh -c '$(CMAKE_BUILD) && \
+	    find src server -name "*.cpp" ! -path "*/tests/*" | \
+	    xargs clang-tidy -p $(BUILD)'
 
 # ── Clean ─────────────────────────────────────────────────────────────────────
 clean:
