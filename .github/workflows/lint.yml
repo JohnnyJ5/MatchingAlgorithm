@@ -18,7 +18,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            g++ cmake libasio-dev libpq-dev clang-tidy
+            g++ cmake libasio-dev libpq-dev clang-tidy libgtest-dev
 
       - name: Configure (generate compile_commands.json)
         run: cmake -S . -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
