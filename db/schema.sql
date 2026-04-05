@@ -68,9 +68,9 @@ CREATE TYPE user_role_type     AS ENUM ('user', 'admin');
 CREATE TABLE users (
     id                          BIGINT          GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     alias                       TEXT            NOT NULL,           -- anonymised display name
-    real_name                   TEXT            NOT NULL,           -- RESTRICTED: owner/admin only
-    email                       TEXT            NOT NULL,           -- RESTRICTED: unique login credential
-    password_hash               TEXT            NOT NULL,           -- RESTRICTED: bcrypt/argon2 output
+    real_name                   TEXT,                               -- RESTRICTED: owner/admin only; NULL after erasure
+    email                       TEXT,                               -- RESTRICTED: unique login credential; NULL after erasure
+    password_hash               TEXT,                               -- RESTRICTED: bcrypt/argon2 output; NULL after erasure
     gender                      gender_type     NOT NULL,
     age                         SMALLINT        NOT NULL CHECK (age >= 18 AND age <= 120),
     bio                         TEXT,                               -- CONFIDENTIAL: visible post-accept

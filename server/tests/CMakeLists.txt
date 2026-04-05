@@ -18,3 +18,11 @@ add_executable(test_db_manager test_db_manager.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../conn_pool.cpp)
 target_include_directories(test_db_manager PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
 target_link_libraries(test_db_manager PRIVATE GTest::gtest_main PostgreSQL::PostgreSQL)
+
+# test_db_manager_integration: live PostgreSQL integration tests.
+# Requires spark_test DB — see server/tests/test_db_manager_integration.cpp header.
+add_executable(test_db_manager_integration test_db_manager_integration.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../db_manager.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../conn_pool.cpp)
+target_include_directories(test_db_manager_integration PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
+target_link_libraries(test_db_manager_integration PRIVATE GTest::gtest_main PostgreSQL::PostgreSQL)

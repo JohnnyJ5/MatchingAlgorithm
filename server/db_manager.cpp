@@ -496,6 +496,9 @@ DbResult<Event> DBManager::createEvent(const CreateEventInput& input) {
     const std::string thr_s  = input.thresholdOverride
                                 ? std::to_string(*input.thresholdOverride) : "";
     const char* thr_ptr      = input.thresholdOverride ? thr_s.c_str() : nullptr;
+    // Pass nullptr for created_by when 0 (no creator) so the FK constraint
+    // isn't violated — the column is nullable (ON DELETE SET NULL).
+    const char* by_ptr       = (input.createdBy != 0) ? by_s.c_str() : nullptr;
 
     const char* params[] = {
         input.name.c_str(),
@@ -504,7 +507,7 @@ DbResult<Event> DBManager::createEvent(const CreateEventInput& input) {
         max_s.c_str(),
         input.algorithmType.c_str(),
         thr_ptr,
-        by_s.c_str()
+        by_ptr
     };
 
     PGResultGuard pgres(PQexecParams(cg.get(),
