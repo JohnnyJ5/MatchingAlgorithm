@@ -9,7 +9,7 @@ ConnGuard::ConnGuard(ConnPool& pool, PGconn* conn) noexcept
     : pool_(&pool), conn_(conn) {}
 
 ConnGuard::~ConnGuard() {
-    if (pool_)
+    if (pool_ != nullptr)
         pool_->release(conn_);
 }
 
@@ -78,7 +78,7 @@ ConnGuard ConnPool::acquireWithTimeout(std::chrono::milliseconds timeout) {
             throw std::runtime_error("ConnPool: connection reset failed");
         }
     }
-    return ConnGuard(*this, conn);
+    return {*this, conn};
 }
 
 void ConnPool::release(PGconn* conn) noexcept {

@@ -88,7 +88,8 @@ static crow::json::wvalue matchesToJson(const std::vector<int>& matchM)
 {
     crow::json::wvalue result;
     crow::json::wvalue::list pairs;
-    int totalScore = 0, matchedCount = 0;
+    int totalScore = 0;
+    int matchedCount = 0;
 
     for (int m = 0; m < N; ++m) {
         crow::json::wvalue pair;
@@ -150,7 +151,7 @@ static std::vector<std::vector<int>> buildWomenPrefs()
 static std::string getenv_or(const char* name, const char* fallback)
 {
     const char* v = std::getenv(name);
-    return v ? v : fallback;
+    return (v != nullptr) ? v : fallback;
 }
 
 // Read a file from disk into a string (used to serve static HTML/CSS/JS).
@@ -269,7 +270,7 @@ int main()
 
     const int poolSize = []() -> int {
         const char* v = std::getenv("DB_POOL_SIZE");
-        return (v && std::stoi(v) > 0) ? std::stoi(v) : 4;
+        return (v != nullptr && std::stoi(v) > 0) ? std::stoi(v) : 4;
     }();
 
     DBManager db(connStr, poolSize);
@@ -324,7 +325,7 @@ int main()
     [&db](const crow::request& req){
         auto body = crow::json::load(req.body);
         if (!body)
-            return crow::response(400, "{\"error\":\"invalid JSON\"}");
+            return crow::response(400, R"({"error":"invalid JSON"})");
 
         for (const char* f : {"alias","real_name","email","password","gender","age"}) {
             if (!body.has(f)) {
@@ -380,7 +381,7 @@ int main()
     [&db](const crow::request& req){
         auto body = crow::json::load(req.body);
         if (!body)
-            return crow::response(400, "{\"error\":\"invalid JSON\"}");
+            return crow::response(400, R"({"error":"invalid JSON"})");
 
         if (!body.has("email") || !body.has("password")) {
             crow::json::wvalue e; e["error"] = "email and password required";
@@ -407,12 +408,13 @@ int main()
     // TODO: gate behind admin JWT for production
     CROW_ROUTE(app, "/api/users").methods(crow::HTTPMethod::GET)(
     [&db](const crow::request& req){
-        int page  = 1, limit = 20;
-        if (req.url_params.get("page"))  page  = std::max(1, std::stoi(req.url_params.get("page")));
-        if (req.url_params.get("limit")) limit = std::max(1, std::min(100, std::stoi(req.url_params.get("limit"))));
+        int page  = 1;
+        int limit = 20;
+        if (req.url_params.get("page") != nullptr)  page  = std::max(1, std::stoi(req.url_params.get("page")));
+        if (req.url_params.get("limit") != nullptr) limit = std::max(1, std::min(100, std::stoi(req.url_params.get("limit"))));
 
         const char* gp = req.url_params.get("gender");
-        const std::string gender_filter = gp ? gp : "";
+        const std::string gender_filter = (gp != nullptr) ? gp : "";
 
         auto result = db.listUsers(page, limit, gender_filter);
         if (!dbOk(result)) {
@@ -470,7 +472,7 @@ int main()
     [&db](const crow::request& req, int id){
         auto body = crow::json::load(req.body);
         if (!body)
-            return crow::response(400, "{\"error\":\"invalid JSON\"}");
+            return crow::response(400, R"({"error":"invalid JSON"})");
 
         UpdateFields fields;
 
@@ -537,7 +539,7 @@ int main()
     [&db](const crow::request& req, int userId){
         auto body = crow::json::load(req.body);
         if (!body)
-            return crow::response(400, "{\"error\":\"invalid JSON\"}");
+            return crow::response(400, R"({"error":"invalid JSON"})");
 
         if (!body.has("answers") || body["answers"].t() != crow::json::type::List) {
             crow::json::wvalue e; e["error"] = "answers array required";
@@ -659,12 +661,12 @@ int main()
         res["n"]       = N;
         res["men"]     = []{
             crow::json::wvalue::list l;
-            for (auto& s : MEN) l.push_back(s);
+            for (const auto& s : MEN) l.emplace_back(s);
             return l;
         }();
         res["women"]   = []{
             crow::json::wvalue::list l;
-            for (auto& s : WOMEN) l.push_back(s);
+            for (const auto& s : WOMEN) l.emplace_back(s);
             return l;
         }();
         return crow::response(200, res);
@@ -788,7 +790,7 @@ int main()
 
     // ── Start server ──────────────────────────────────────────────────────────
     const char* port_env = std::getenv("PORT");
-    uint16_t port = port_env ? static_cast<uint16_t>(std::stoi(port_env)) : 8081;
+    uint16_t port = (port_env != nullptr) ? static_cast<uint16_t>(std::stoi(port_env)) : 8081;
     std::cout << "Blind Dating API server listening on 0.0.0.0:" << port << "\n";
     app.port(port).bindaddr("0.0.0.0").multithreaded().run();
     return 0;

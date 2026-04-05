@@ -23,7 +23,8 @@ void Hungarian::solve() {
 
     // u[i] = potential for row i (0..n-1), v[j] = potential for col j (0..n-1).
     // row 0 is a dummy row, so arrays are size n+1.
-    std::vector<int> u(n_ + 1, 0), v(n_ + 1, 0);
+    std::vector<int> u(n_ + 1, 0);
+    std::vector<int> v(n_ + 1, 0);
     std::vector<int> p(n_ + 1, 0);   // p[j] = row assigned to column j (0 = unassigned)
     std::vector<int> way(n_ + 1, 0); // augmentation path
 
@@ -35,7 +36,9 @@ void Hungarian::solve() {
 
         do {
             used[j0] = true;
-            int i0 = p[j0], delta = INF, j1 = -1;
+            int i0 = p[j0];
+            int delta = INF;
+            int j1 = -1;
             for (int j = 1; j <= n_; ++j) {
                 if (!used[j]) {
                     int cur = cost_[i0 - 1][j - 1] - u[i0] - v[j];
@@ -64,7 +67,7 @@ void Hungarian::solve() {
             int j1 = way[j0];
             p[j0] = p[j1];
             j0 = j1;
-        } while (j0);
+        } while (j0 != 0);
     }
 
     assignment_.assign(n_, -1);
