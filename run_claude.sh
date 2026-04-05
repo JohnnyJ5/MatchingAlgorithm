@@ -47,6 +47,18 @@ else
 
     mkdir -p .claude_workspace_env/.ssh
 
+    if [ ! -f ".claude_workspace_env/.ssh/config" ]; then
+        cat > .claude_workspace_env/.ssh/config <<'EOF'
+Host github.com
+    HostName github.com
+    User git
+    IdentityFile ~/.ssh/id_ed25519
+    IdentitiesOnly yes
+    StrictHostKeyChecking no
+EOF
+        chmod 600 .claude_workspace_env/.ssh/config
+    fi
+
     docker build -t claude-cli-env -f Dockerfile.claude .
 
     # Clone and install dotfiles on first run so ~/.claude agents/settings are available
