@@ -1,0 +1,84 @@
+name: PR Checks
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ── 1. Unit tests (native build; no Docker overhead) ─────────────────────────
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ cmake libpq-dev libasio-dev git
+
+      - name: Cache FetchContent downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.cmake-fetchcontent
+          key: fetchcontent-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
+
+      - name: Configure
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DFETCHCONTENT_BASE_DIR=$HOME/.cmake-fetchcontent
+
+      - name: Build test binaries
+        run: |
+          cmake --build build --parallel \
+            --target test_gale_shapley test_hopcroft_karp test_hungarian test_blossom \
+                    test_db_types test_conn_pool test_db_manager
+
+      - name: Run tests
+        run: |
+          for bin in \
+            build/test_gale_shapley \
+            build/test_hopcroft_karp \
+            build/test_hungarian \
+            build/test_blossom \
+            build/test_db_types \
+            build/test_conn_pool \
+            build/test_db_manager; do
+            echo "=== $bin ==="
+            ./$bin
+          done
+
+  # ── 2. Runtime Docker image build (catches linker/Dockerfile issues) ──────────
+  runtime-build:
+    name: Runtime Docker Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build runtime image
+        run: docker build --target runtime -t datingapp:pr-check .
+
+  # ── 3. clang-format (changed C++ files only) ──────────────────────────────────
+  clang-format:
+    name: clang-format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install clang-format
+        run: sudo apt-get install -y clang-format
+
+      - name: Check formatting on changed C++ files
+        run: |
+          BASE="${{ github.event.pull_request.base.sha }}"
+          CHANGED=$(git diff --name-only "$BASE" HEAD -- '*.cpp' '*.h')
+          if [ -z "$CHANGED" ]; then
+            echo "No C++ files changed — nothing to check."
+            exit 0
+          fi
+          echo "Checking:"
+          echo "$CHANGED"
+          echo "$CHANGED" | xargs clang-format --dry-run --Werror

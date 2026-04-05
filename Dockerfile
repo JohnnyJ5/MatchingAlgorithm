@@ -19,7 +19,7 @@ FROM dev AS builder
 
 COPY . .
 
-RUN cmake -S . -B build && cmake --build build --parallel
+RUN cmake -S . -B build && cmake --build build --parallel --target server
 
 # ── Runtime stage ─────────────────────────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime

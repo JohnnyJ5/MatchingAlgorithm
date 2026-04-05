@@ -1,0 +1,101 @@
+name: Sanitizer Builds
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ── AddressSanitizer + UndefinedBehaviorSanitizer ─────────────────────────────
+  asan-ubsan:
+    name: ASan + UBSan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ cmake libpq-dev libasio-dev git
+
+      - name: Cache FetchContent downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.cmake-fetchcontent
+          key: fetchcontent-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
+
+      - name: Configure (ASan + UBSan)
+        run: |
+          cmake -S . -B build-asan \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
+            -DFETCHCONTENT_BASE_DIR=$HOME/.cmake-fetchcontent
+
+      - name: Build test binaries
+        run: |
+          cmake --build build-asan --parallel \
+            --target test_gale_shapley test_hopcroft_karp test_hungarian test_blossom \
+                    test_db_types test_conn_pool test_db_manager
+
+      - name: Run tests
+        env:
+          ASAN_OPTIONS: abort_on_error=1:detect_leaks=1
+          UBSAN_OPTIONS: abort_on_error=1:print_stacktrace=1
+        run: |
+          for bin in \
+            build-asan/test_gale_shapley \
+            build-asan/test_hopcroft_karp \
+            build-asan/test_hungarian \
+            build-asan/test_blossom \
+            build-asan/test_db_types \
+            build-asan/test_conn_pool \
+            build-asan/test_db_manager; do
+            echo "=== $bin ==="
+            ./$bin
+          done
+
+  # ── ThreadSanitizer ───────────────────────────────────────────────────────────
+  tsan:
+    name: ThreadSanitizer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ cmake libpq-dev libasio-dev git
+
+      - name: Cache FetchContent downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.cmake-fetchcontent
+          key: fetchcontent-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
+
+      - name: Configure (TSan)
+        run: |
+          cmake -S . -B build-tsan \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer" \
+            -DFETCHCONTENT_BASE_DIR=$HOME/.cmake-fetchcontent
+
+      - name: Build test binaries
+        run: |
+          cmake --build build-tsan --parallel \
+            --target test_gale_shapley test_hopcroft_karp test_hungarian test_blossom \
+                    test_db_types test_conn_pool test_db_manager
+
+      - name: Run tests
+        env:
+          TSAN_OPTIONS: abort_on_error=1:halt_on_error=1
+        run: |
+          for bin in \
+            build-tsan/test_gale_shapley \
+            build-tsan/test_hopcroft_karp \
+            build-tsan/test_hungarian \
+            build-tsan/test_blossom \
+            build-tsan/test_db_types \
+            build-tsan/test_conn_pool \
+            build-tsan/test_db_manager; do
+            echo "=== $bin ==="
+            ./$bin
+          done

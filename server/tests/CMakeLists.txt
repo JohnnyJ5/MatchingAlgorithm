@@ -1,4 +1,3 @@
-find_package(GTest REQUIRED)
 find_package(PostgreSQL REQUIRED)
 
 # test_db_types: pure C++ — no libpq dependency.
