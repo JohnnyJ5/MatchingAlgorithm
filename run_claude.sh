@@ -41,8 +41,19 @@ else
     echo "Starting a new '${CONTAINER_NAME}' container..."
 
     if [ ! -f "$HOME/.ssh/claude_github" ]; then
-        echo "ERROR: SSH key not found at ~/.ssh/claude_github"
-        exit 1
+        echo "SSH key not found at ~/.ssh/claude_github — generating a new ed25519 key..."
+        mkdir -p "$HOME/.ssh"
+        chmod 700 "$HOME/.ssh"
+        ssh-keygen -t ed25519 -C "claude-github" -f "$HOME/.ssh/claude_github" -N ""
+        echo ""
+        echo "============================================================"
+        echo "New SSH public key (add this to GitHub -> Settings -> SSH keys):"
+        echo "============================================================"
+        cat "$HOME/.ssh/claude_github.pub"
+        echo "============================================================"
+        echo ""
+        echo "After adding the key to GitHub, re-run this script."
+        exit 0
     fi
 
     mkdir -p .claude_workspace_env/.ssh
